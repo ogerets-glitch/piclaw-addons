@@ -35,10 +35,13 @@ const ICON = HAS_RUNTIME
 function TelegramSettings() {
   if (!HAS_RUNTIME) return null;
 
-  const [config, setConfig] = useState({ enabled: false, pollingTimeout: 30, connected: false, botTokenConfigured: false });
+  const [config, setConfig] = useState({ enabled: false, pollingTimeout: 30, connected: false, botTokenConfigured: false, status: "", targets: [] as any[] });
   const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
   const [botToken, setBotToken] = useState("");
   const [enabled, setEnabled] = useState(false);
+  const [allowedUserIds, setAllowedUserIds] = useState("");
+  const [targetChatJid, setTargetChatJid] = useState("");
   const [pollingTimeout, setPollingTimeout] = useState(30);
 
   const loadConfig = useCallback(async () => {
@@ -50,6 +53,8 @@ function TelegramSettings() {
         setConfig({ ...data, botTokenConfigured });
         setBotToken("");
         setEnabled(data.enabled ?? false);
+        setAllowedUserIds(Array.isArray(data.allowedUserIds) ? data.allowedUserIds.join(", ") : "");
+        setTargetChatJid(data.targetChatJid ?? "");
         setPollingTimeout(data.pollingTimeout ?? 30);
       }
     } catch { /* ignore */ }
@@ -59,23 +64,23 @@ function TelegramSettings() {
 
   const saveConfig = useCallback(async () => {
     setSaving(true);
+    setError("");
     try {
       const nextToken = botToken.trim();
-      if (nextToken && !(await saveKeychainToken(nextToken))) throw new Error("Failed to save Telegram token to keychain");
-      const body: any = { enabled, pollingTimeout };
+      if (nextToken && !(await saveKeychainToken(nextToken))) throw new Error("Failed to save Telegram token to keychain.");
+      const body: any = { enabled, allowedUserIds, targetChatJid, pollingTimeout };
       const res = await fetch(`/agent/addons/api/${ADDON_ID}/config`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
-      if (res.ok) {
-        const data = await res.json();
-        setConfig({ ...data, botTokenConfigured: data.botTokenConfigured || Boolean(nextToken) || config.botTokenConfigured });
-        setBotToken("");
-      }
-    } catch { /* ignore */ }
+      if (!res.ok) throw new Error("Save failed. Check the user IDs and the target chat.");
+      const data = await res.json();
+      setConfig({ ...data, botTokenConfigured: data.botTokenConfigured || Boolean(nextToken) || config.botTokenConfigured });
+      setBotToken("");
+    } catch (err: any) { setError(err?.message || "Save failed."); }
     setSaving(false);
-  }, [botToken, config.botTokenConfigured, enabled, pollingTimeout]);
+  }, [botToken, config.botTokenConfigured, enabled, allowedUserIds, targetChatJid, pollingTimeout]);
 
   return html`
     <section data-settings-addon="telegram">
@@ -88,7 +93,7 @@ function TelegramSettings() {
         <label style="font-size: 13px; color: var(--text-secondary, #71767b); min-width: 120px; text-align: right;">Enabled</label>
         <input type="checkbox" checked=${enabled} onChange=${(e: any) => setEnabled(e.target.checked)} />
         <span style="font-size: 12px; color: var(--text-secondary, #71767b);">
-          ${config.connected ? "✅ Connected" : "⏸ Disconnected"}
+          ${config.connected ? "✅ Connected" : "⏸ Disconnected"}${config.status ? ` — ${config.status}` : ""}
         </span>
       </div>
 
@@ -100,6 +105,29 @@ function TelegramSettings() {
           placeholder=${config.botTokenConfigured ? "••••••• (stored in keychain)" : "123456:ABC-DEF..."}
           onInput=${(e: any) => setBotToken(e.target.value)}
         />
+      </div>
+
+      <div class="settings-addon-field">
+        <label class="settings-addon-label" for="telegram-users">Allowed Telegram user IDs</label>
+        <input class="settings-addon-control" id="telegram-users"
+          type="text"
+          inputmode="numeric"
+          value=${allowedUserIds}
+          placeholder="123456789"
+          onInput=${(e: any) => setAllowedUserIds(e.target.value)}
+        />
+        <span class="settings-addon-help">Numeric user IDs, comma separated. Only private chats with these users are accepted; with no IDs the channel stays off.</span>
+      </div>
+
+      <div class="settings-addon-field">
+        <label class="settings-addon-label" for="telegram-target">Target chat</label>
+        ${config.targets?.length
+          ? html`<select class="settings-addon-control" id="telegram-target" value=${targetChatJid} onChange=${(e: any) => setTargetChatJid(e.target.value)}>
+              <option value="">Select a dedicated chat</option>
+              ${config.targets.map((t: any) => html`<option value=${t.chatJid}>${t.label || t.chatJid}</option>`)}
+            </select>`
+          : html`<input class="settings-addon-control" id="telegram-target" type="text" value=${targetChatJid} placeholder="web:telegram" onInput=${(e: any) => setTargetChatJid(e.target.value)} />`}
+        <span class="settings-addon-help">An existing web chat used only for Telegram (not web:default). Its replies to Telegram messages are sent back to the sender.</span>
       </div>
 
       <div class="settings-addon-field">
@@ -124,8 +152,11 @@ function TelegramSettings() {
         </button>
       </div>
 
+      <p class="settings-addon-help" role="status">${error}</p>
+
       <p style="font-size: 11px; color: var(--text-secondary, #71767b); margin-top: 12px;">
-        Create a bot via <a href="https://t.me/BotFather" target="_blank" style="color: var(--accent, #1d9bf0);">@BotFather</a> on Telegram. The token is stored in keychain entry <code>${BOT_TOKEN_KEYCHAIN}</code>. Restart PiClaw after changing it.
+        Create a bot via <a href="https://t.me/BotFather" target="_blank" style="color: var(--accent, #1d9bf0);">@BotFather</a> on Telegram. The token is stored in keychain entry <code>${BOT_TOKEN_KEYCHAIN}</code>. Saving applies the settings immediately.
+        Allowed users get the same agent and tool rights as the target web chat.
       </p>
     </section>
   `;
