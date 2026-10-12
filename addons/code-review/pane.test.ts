@@ -395,7 +395,16 @@ test("CR-001/012/033/111 browser drives real review persistence and one explicit
     expect(store.listDrafts(ctx, review.id).some((d: any) => d.body === "Never committed reply.")).toBe(true);
     // A committed reply may race with another tab deleting or editing its draft.
     // The pane must report the public commit even if draft cleanup conflicts.
+    // File selection persists drafts and loads projections asynchronously.
+    const fileLoaded = page.waitForResponse(response => {
+      const request = response.request();
+      if (!request.url().endsWith('/agent/addons/api/code-review/action')) return false;
+      const body = request.postDataJSON();
+      return body?.action === 'file' && response.ok();
+    });
     await page.locator(".cr-files [data-action=file]").filter({ hasText: "sample.ts" }).click();
+    await fileLoaded;
+    await page.locator('.cr-files [data-action=file].active').filter({hasText:'sample.ts'}).waitFor();
     await page.locator("[data-action=threads]").click();
     await page.locator(".cr-drawer [data-action=jump]").first().click();
     await page.waitForSelector(".cr-thread [data-action=reply]");
