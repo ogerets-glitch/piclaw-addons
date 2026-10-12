@@ -224,7 +224,7 @@
   ],
   "devDependencies": {
     "@a2a-js/sdk": "1.1.0",
-    "@earendil-works/pi-agent-core": "0.84.4",
+    "@earendil-works/pi-agent-core": "1.1.0",
     "@earendil-works/pi-ai": "0.84.4",
     "@earendil-works/pi-coding-agent": "0.84.4",
     "@earendil-works/pi-tui": "0.84.4",
