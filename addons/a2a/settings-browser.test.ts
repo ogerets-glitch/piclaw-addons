@@ -1,3 +1,4 @@
+import { createRequire } from "node:module";
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
@@ -27,8 +28,8 @@ beforeAll(async () => {
   const { chromium } = await import(
     join(core, "node_modules/playwright/index.mjs")
   );
-  const preact = join(core, "node_modules/preact"),
-    htm = join(core, "node_modules/htm");
+  const hostRequire = createRequire(join(core, "package.json"));
+  const preact = hostRequire.resolve("preact"), hooks = hostRequire.resolve("preact/hooks"), htm = hostRequire.resolve("htm");
   root = mkdtempSync(join(tmpdir(), "a2a-ui-"));
   const bundle = await Bun.build({
     entrypoints: [new URL("./web/index.ts", import.meta.url).pathname],
@@ -39,7 +40,7 @@ beforeAll(async () => {
   const shim = join(root, "shim.ts");
   await Bun.write(
     shim,
-    `import {h,render} from ${JSON.stringify(preact + "/dist/preact.module.js")};import {useEffect,useState} from ${JSON.stringify(preact + "/hooks/dist/hooks.module.js")};import htm from ${JSON.stringify(htm + "/dist/htm.module.js")};window.__piclawPreactHtm={html:htm.bind(h),useEffect,useState};window.__piclaw_web={registerSettingsPane(p){if(!p.component)throw new Error('Host requires component');render(h(p.component),document.getElementById('app'));}};await import('/settings.js');`,
+    `import {h,render} from ${JSON.stringify(preact)};import {useEffect,useState} from ${JSON.stringify(hooks)};import htm from ${JSON.stringify(htm)};window.__piclawPreactHtm={html:htm.bind(h),useEffect,useState};window.__piclaw_web={registerSettingsPane(p){if(!p.component)throw new Error('Host requires component');render(h(p.component),document.getElementById('app'));}};await import('/settings.js');`,
   );
   const compiled = await Bun.build({
     entrypoints: [shim],
@@ -51,7 +52,7 @@ beforeAll(async () => {
         name: "preact-resolution",
         setup(build) {
           build.onResolve({ filter: /^preact$/ }, () => ({
-            path: preact + "/dist/preact.module.js",
+            path: preact,
           }));
         },
       },

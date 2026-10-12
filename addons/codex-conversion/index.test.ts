@@ -182,10 +182,10 @@ test("native web search declaration is scoped to OpenAI Codex", () => {
 });
 
 test("provider overlay delegates all requests and only observes native output turns", () => {
-  expect(requiresNativeOutputCapture({ tools: [] })).toBe(false);
-  expect(requiresNativeOutputCapture({ tools: [{ name: "exec_command" } as any] })).toBe(false);
-  expect(requiresNativeOutputCapture({ tools: [{ name: "web_search" } as any] })).toBe(true);
-  expect(requiresNativeOutputCapture({ tools: [{ name: "image_generation" } as any] })).toBe(true);
+  expect(requiresNativeOutputCapture({ messages: [], tools: [] })).toBe(false);
+  expect(requiresNativeOutputCapture({ messages: [], tools: [{ name: "exec_command" } as any] })).toBe(false);
+  expect(requiresNativeOutputCapture({ messages: [], tools: [{ name: "web_search" } as any] })).toBe(true);
+  expect(requiresNativeOutputCapture({ messages: [], tools: [{ name: "image_generation" } as any] })).toBe(true);
 
   const providers: Array<{ id: string; config: any }> = [];
   const builtinStream = { delegated: true } as any;

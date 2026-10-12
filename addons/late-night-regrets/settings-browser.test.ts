@@ -1,7 +1,6 @@
 import { expect, test } from "bun:test";
 import { chromium, webkit } from "playwright";
-import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 
 /** Real component and direct config handlers, fake local-only model catalogue. No Piclaw service. */
 test("Settings model picker loads, saves, persists, disables and survives errors in Chromium/WebKit", async () => {
@@ -24,13 +23,22 @@ test("Settings model picker loads, saves, persists, disables and survives errors
   });
   expect(bundle.success).toBe(true);
   const js = await bundle.outputs[0].text();
-  const dependency = (name: string, filename: string) =>
-    Bun.file(join(dirname(fileURLToPath(import.meta.resolve(name))), filename));
+  const hostBundle = await Bun.build({
+    entrypoints: ["fixture:host"],
+    plugins: [{ name: "host-fixture", setup(build) {
+      build.onResolve({ filter: /^fixture:host$/ }, () => ({ path: "host", namespace: "fixture" }));
+      build.onLoad({ filter: /.*/, namespace: "fixture" }, () => ({ contents: "import * as preact from \"preact\"; import * as hooks from \"preact/hooks\"; import htm from \"htm\"; globalThis.preact = preact; globalThis.preactHooks = hooks; globalThis.htm = htm;", loader: "js" }));
+    } }],
+    target: "browser",
+  });
+  expect(hostBundle.success).toBe(true);
+  const hostJs = await hostBundle.outputs[0].text();
   const html = `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"></head><body><div id="root"></div>
-<script src="/preact.js"></script><script src="/hooks.js"></script><script src="/htm.js"></script><script>
+<script type="module">
+import "/host.js";
 window.__piclawPreactHtm={html:htm.bind(preact.h),...preactHooks};
 window.__piclawSettingsPaneRegistry={registerSettingsPane(p){preact.render(preact.h(p.component),document.getElementById('root'))}};
-</script><script type="module" src="/addon.js"></script></body></html>`;
+await import("/addon.js");</script></body></html>`;
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
@@ -42,12 +50,8 @@ window.__piclawSettingsPaneRegistry={registerSettingsPane(p){preact.render(preac
         return new Response(js, {
           headers: { "content-type": "application/javascript" },
         });
-      if (path === "/preact.js")
-        return new Response(dependency("preact", "preact.umd.js"));
-      if (path === "/hooks.js")
-        return new Response(dependency("preact/hooks", "hooks.umd.js"));
-      if (path === "/htm.js")
-        return new Response(dependency("htm", "htm.umd.js"));
+      if (path === "/host.js")
+        return new Response(hostJs, { headers: { "content-type": "application/javascript" } });
       if (path.endsWith("/models"))
         return Response.json({ ok: true, models: availableModels() });
       if (path.endsWith("/config")) {

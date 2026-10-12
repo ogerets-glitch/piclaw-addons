@@ -51,6 +51,7 @@ describe("smart-compaction addon", () => {
         return {
           ok: true as const,
           apiKey: "resolved-key",
+          baseUrl: "https://auth-selected.example/v1",
           headers: { "x-provider": "resolved", "x-shared": "auth", "x-delete": "auth" },
           env: { AWS_REGION: "eu-west-1", SHARED_ENV: "auth" },
         };
@@ -59,6 +60,7 @@ describe("smart-compaction addon", () => {
 
     expect(resolution.ok).toBe(true);
     if (!resolution.ok) throw new Error(resolution.error);
+    expect(resolution.auth.baseUrl).toBe('https://auth-selected.example/v1');
     const options = buildCompatibilityCompletionOptions(model, resolution.auth, {
       maxTokens: 123,
       signal,
@@ -98,4 +100,8 @@ describe("smart-compaction addon", () => {
       async getApiKeyAndHeaders() { return { ok: false as const, error: "not configured" }; },
     }, model)).resolves.toEqual({ ok: false, error: "not configured" });
   });
+});
+
+test('auth endpoint applies to a request-local model without mutating registry state',async()=>{
+ const {modelWithCompatibilityAuth}=await import('./src/model-execution');const model:any={baseUrl:'https://catalog.example/v1'};const request=modelWithCompatibilityAuth(model,{baseUrl:'https://credential.example/v1'});expect(request.baseUrl).toBe('https://credential.example/v1');expect(model.baseUrl).toBe('https://catalog.example/v1');expect(modelWithCompatibilityAuth(model,{})).toBe(model);
 });

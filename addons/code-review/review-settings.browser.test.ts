@@ -1,3 +1,4 @@
+import {createRequire} from 'node:module';
 import {test,expect} from 'bun:test';
 import {chromium} from 'playwright';
 import {mkdtempSync,mkdirSync,writeFileSync,rmSync,unlinkSync} from 'node:fs';
@@ -19,9 +20,10 @@ settingsTest('Settings opens/deletes reviews with missing sources; identities, f
   const thread:any=await reviewAction(ctx,'comment',{reviewId:created.reviewId,fileId:created.files[0],side:'source',range:{startLine:2,endLine:2},body:'Please reject an empty name before trimming.',requestId:'comment-fixture'},service);
   service.reply({ownerId:ctx.ownerId,actorId:target.incarnation,kind:'agent',workspaceId:ctx.workspaceId,chatId:target.chatJid,chatIncarnation:target.incarnation},thread.threadId,'I will add an explicit check and a regression test.',{requestId:'agent-reply',expectedVersion:1},1);
   const core=process.env.PICLAW_SETTINGS_CORE_SOURCE!;
-  const preactPath=join(core,'node_modules/preact');
-  const preactEntry=join(root,'preact.ts');writeFileSync(preactEntry,`import{h,render}from '${preactPath}/dist/preact.module.js';import{useRef,useEffect}from '${preactPath}/hooks/dist/hooks.module.js';import htm from '${join(core,'node_modules/htm/dist/htm.module.js')}';window.__piclawPreactHtm={h,render,useRef,useEffect,html:htm.bind(h)};`);
-  const build=await Bun.build({entrypoints:[preactEntry],outdir:root,target:'browser',format:'esm',naming:'preact.js',plugins:[{name:'one-preact',setup(build){build.onResolve({filter:/^preact$/},()=>({path:join(preactPath,'dist/preact.module.js')}));}}]});expect(build.success).toBe(true);
+  const hostRequire=createRequire(join(core,'package.json'));
+  const preactPath=hostRequire.resolve('preact'),hooksPath=hostRequire.resolve('preact/hooks'),htmPath=hostRequire.resolve('htm');
+  const preactEntry=join(root,'preact.ts');writeFileSync(preactEntry,`import{h,render}from '${preactPath}';import{useRef,useEffect}from '${hooksPath}';import htm from '${htmPath}';window.__piclawPreactHtm={h,render,useRef,useEffect,html:htm.bind(h)};`);
+  const build=await Bun.build({entrypoints:[preactEntry],outdir:root,target:'browser',format:'esm',naming:'preact.js',plugins:[{name:'one-preact',setup(build){build.onResolve({filter:/^preact$/},()=>({path:preactPath}));}}]});expect(build.success).toBe(true);
   const transpile=new Bun.Transpiler({loader:'ts',target:'browser'});
   server=Bun.serve({hostname:'127.0.0.1',port:0,async fetch(req){const path=new URL(req.url).pathname;
    if(path==='/')return new Response(`<!doctype html><html><head><link rel="stylesheet" href="/static/classic/fixture.css"><style>:root{--bg-primary:#fff;--bg-secondary:#f6f6f6;--bg-hover:#eee;--border-color:#d0d0d0;--text-primary:#222;--text-secondary:#666;--accent-color:#176f83;--accent-contrast-text:#fff;--bg-code:#fafafa;--text-code:#222;--font-family:system-ui;--font-family-mono:monospace}*{box-sizing:border-box}body{margin:0;font:13px system-ui}nav{height:42px;padding:8px 12px;background:#f3f3f3;border-bottom:1px solid #ccc}#pane{height:calc(100vh - 42px)}#settings{padding:16px}</style></head><body><nav><button id="settings-button">Code Review Settings</button> <span>Review · validation.ts</span></nav><main id="pane"></main><main id="settings" hidden></main><script type="module">
