@@ -1,4 +1,5 @@
 /** Disposable component fixture. Core owns actual Settings-host integration. */
+import { createRequire } from "node:module";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, extname, join, resolve } from "node:path";
@@ -14,12 +15,15 @@ export async function settingsPaneFixture(entry: string, options: { realHost?: b
   let browser: any;
   let server: ReturnType<typeof Bun.serve> | undefined;
   try {
-    const preact = join(core, "node_modules/preact");
+    const hostRequire = createRequire(join(core, "package.json"));
+    const preact = hostRequire.resolve("preact");
+    const hooks = hostRequire.resolve("preact/hooks");
+    const htm = hostRequire.resolve("htm");
     const shim = join(root, "entry.ts");
     await Bun.write(shim, `
-      import {h,render} from ${JSON.stringify(preact + "/dist/preact.module.js")};
-      import * as hooks from ${JSON.stringify(preact + "/hooks/dist/hooks.module.js")};
-      import htm from ${JSON.stringify(join(core, "node_modules/htm/dist/htm.module.js"))};
+      import {h,render} from ${JSON.stringify(preact)};
+      import * as hooks from ${JSON.stringify(hooks)};
+      import htm from ${JSON.stringify(htm)};
       const skin=new URLSearchParams(location.search).get('skin');
       const root=document.getElementById('app');
       if (${options.realHost === true} && skin==='classic') {
@@ -51,7 +55,7 @@ export async function settingsPaneFixture(entry: string, options: { realHost?: b
     `);
     const built = await Bun.build({ entrypoints: [shim], target: "browser", external: ["/addon/index.ts"], plugins: [{
       name: "single-preact", setup(build) {
-        build.onResolve({ filter: /^preact$/ }, () => ({ path: preact + "/dist/preact.module.js" }));
+        build.onResolve({ filter: /^preact$/ }, () => ({ path: preact }));
       },
     }] });
     if (!built.success) throw new Error(String(built.logs));
