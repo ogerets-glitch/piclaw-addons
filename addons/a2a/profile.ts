@@ -4,7 +4,7 @@ export const A2A_PROFILE = Object.freeze({
   specificationCommit: "3303592588e388e62e0f69f701af531d2f4e3991",
   wireVersion: "1.0",
   sdk: "@a2a-js/sdk",
-  sdkVersion: "1.1.0",
+  sdkVersion: "1.3.0",
   binding: "JSONRPC",
   cardPath: "/api/addons/a2a/agent-card.json",
   rpcPath: "/api/addons/a2a/rpc",

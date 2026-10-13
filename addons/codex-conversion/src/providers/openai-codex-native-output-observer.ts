@@ -4,7 +4,7 @@ import { dirname, join, relative, resolve } from "node:path";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { streamSimple as streamBuiltinProvider } from "@earendil-works/pi-ai/compat";
-import type { Context, FetchFunction } from "@earendil-works/pi-ai";
+import { getCurrentTools, normalizeContext, type Context, type FetchFunction } from "@earendil-works/pi-ai";
 import { Box, Image, Spacer, Text } from "@earendil-works/pi-tui";
 
 export const IMAGE_SAVE_DISPLAY_MESSAGE_TYPE = "codex-image-generation-display";
@@ -63,8 +63,8 @@ interface ResponsesEvent {
  * only when a turn advertises a provider tool whose completed output item is
  * not exposed by pi-ai 0.84.4.
  */
-export function requiresNativeOutputCapture(context: Pick<Context, "tools">): boolean {
-	return context.tools?.some((tool) => NATIVE_OUTPUT_TOOL_NAMES.has(tool.name)) ?? false;
+export function requiresNativeOutputCapture(context: Context): boolean {
+	return getCurrentTools(normalizeContext(context).messages).some((tool) => NATIVE_OUTPUT_TOOL_NAMES.has(tool.name));
 }
 
 function normalizeImageOutputFormat(value: string | undefined): "png" | "jpg" | "jpeg" | "webp" {

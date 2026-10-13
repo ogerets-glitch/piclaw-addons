@@ -1,4 +1,5 @@
 /** Standalone loopback-only browser fixture; requires installed Playwright and host Preact/HTM bundles. */
+import { createRequire } from "node:module";
 import { resolve } from "node:path";
 const playwrightPath = process.env.LINKR_FIXTURE_PLAYWRIGHT;
 const hostModules = process.env.LINKR_FIXTURE_HOST_MODULES;
@@ -6,7 +7,17 @@ if (!playwrightPath || !hostModules)
   throw new Error(
     "Set LINKR_FIXTURE_PLAYWRIGHT to Playwright index.mjs and LINKR_FIXTURE_HOST_MODULES to installed host node_modules.",
   );
-const { chromium } = await import(playwrightPath);
+const { chromium, webkit } = await import(playwrightPath);
+const hostRequire = createRequire(resolve(hostModules, "../package.json"));
+const hostBuild = await Bun.build({
+  entrypoints: ["fixture:host"], target: "browser", plugins: [{name: "host-exports", setup(build) {
+    build.onResolve({filter: /^fixture:host$/}, () => ({path: "host", namespace: "fixture"}));
+    build.onResolve({filter: /^(preact(?:\/hooks)?|htm)$/}, args => ({path: hostRequire.resolve(args.path)}));
+    build.onLoad({filter: /.*/, namespace: "fixture"}, () => ({contents: `import * as preact from "preact"; import * as hooks from "preact/hooks"; import htm from "htm"; globalThis.preact=preact; globalThis.preactHooks=hooks; globalThis.htm=htm;`, loader: "js"}));
+  }}],
+});
+if (!hostBuild.success) throw new Error(String(hostBuild.logs));
+const hostJs = await hostBuild.outputs[0].text();
 const repo = resolve(import.meta.dir, "../../..");
 const build = await Bun.build({
   entrypoints: [repo + "/addons/linkr/web/index.ts"],
@@ -26,15 +37,7 @@ const server = Bun.serve({
       return new Response(bundle, {
         headers: { "Content-Type": "text/javascript" },
       });
-    const files: any = {
-      "/preact.js": "preact/dist/preact.umd.js",
-      "/hooks.js": "preact/hooks/dist/hooks.umd.js",
-      "/htm.js": "htm/dist/htm.umd.js",
-    };
-    if (files[p])
-      return new Response(Bun.file(resolve(hostModules, files[p])), {
-        headers: { "Content-Type": "text/javascript" },
-      });
+    if (p === "/host.js") return new Response(hostJs, {headers: {"Content-Type": "text/javascript"}});
     if (p === "/agent/addons/api/linkr/config") {
       if (req.method === "POST") {
         saved = await req.json();
@@ -44,12 +47,14 @@ const server = Bun.serve({
     }
     if (p.includes("snapshot")) snapshotRequests++;
     return new Response(
-      `<html><head><style>body{font:16px system-ui;background:#171b22;color:#e9eef7;padding:24px;max-width:850px}input{padding:8px;background:#242b35;color:white;border:1px solid #65738b}button{padding:10px;margin:8px}fieldset{border:1px solid #65738b}</style></head><body><div id="root"></div><script src="/preact.js"></script><script src="/hooks.js"></script><script src="/htm.js"></script><script type="module">window.__piclawPreactHtm={...preact,...preactHooks,html:htm.bind(preact.h)};window.__piclaw_web={registerSettingsPane(p){preact.render(preact.h(p.component),document.getElementById('root'))}};await import('/addon.js');</script></body></html>`,
+      `<html><head><style>body{font:16px system-ui;background:#171b22;color:#e9eef7;padding:24px;max-width:850px}input{padding:8px;background:#242b35;color:white;border:1px solid #65738b}button{padding:10px;margin:8px}fieldset{border:1px solid #65738b}</style></head><body><div id="root"></div><script type="module">import "/host.js";window.__piclawPreactHtm={...preact,...preactHooks,html:htm.bind(preact.h)};window.__piclaw_web={registerSettingsPane(p){preact.render(preact.h(p.component),document.getElementById('root'))}};await import('/addon.js');</script></body></html>`,
       { headers: { "Content-Type": "text/html" } },
     );
   },
 });
-const browser = await chromium.launch({ headless: true });
+try {
+for (const engine of [chromium, webkit]) {
+const browser = await engine.launch({ headless: true });
 try {
   const page = await browser.newPage({
     viewport: { width: 1050, height: 1050 },
@@ -80,12 +85,15 @@ try {
   )
     throw new Error(JSON.stringify({ saved, errors, snapshotRequests }));
   await page.screenshot({
-    path: repo + "/addons/linkr/docs/settings-fixture.png",
+    path: (process.env.LINKR_FIXTURE_SCREENSHOTS || repo + "/addons/linkr/docs") + "/settings-fixture-" + engine.name() + ".png",
   });
   console.log(
-    "PASS Settings mock browser: render, edit, confirmation, save, HID disabled, no device traffic, no page errors",
+    "PASS " + engine.name() + " Settings mock browser: render, edit, confirmation, save, HID disabled, no device traffic, no page errors",
   );
 } finally {
   await browser.close();
+}
+}
+} finally {
   server.stop(true);
 }

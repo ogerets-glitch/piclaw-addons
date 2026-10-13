@@ -98,6 +98,8 @@ function estimateMessageTokens(message: Message): number {
       else if (content.type === "thinking") characters += content.thinking.length;
       else characters += content.name.length + JSON.stringify(content.arguments).length;
     }
+  } else if (message.role === "system") {
+    characters += JSON.stringify(message).length;
   } else {
     characters += message.toolName.length;
     for (const content of message.content) characters += content.type === "image" ? 4_800 : content.text.length;

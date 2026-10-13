@@ -4,6 +4,7 @@ import { completeSimple } from "@earendil-works/pi-ai/compat";
 
 export type CompatibilityRequestAuth = {
   apiKey?: string;
+  baseUrl?: string;
   headers?: ProviderHeaders;
   env?: Record<string, string>;
 };
@@ -15,8 +16,8 @@ export type CompatibilityAuthResolution =
 /**
  * External extensions receive ModelRegistry rather than the process ModelRuntime.
  * Resolve its complete public compatibility auth contract once per compaction.
- * The canonical model object is forwarded unchanged so its composed baseUrl is
- * preserved; apiKey, headers, and provider-scoped env travel in request options.
+ * Auth-selected endpoints are applied to a request-local model copy; credentials,
+ * headers and provider-scoped env travel in request options.
  */
 export async function resolveCompatibilityRequestAuth(
   registry: Pick<ExtensionContext["modelRegistry"], "getApiKeyAndHeaders">,
@@ -28,6 +29,7 @@ export async function resolveCompatibilityRequestAuth(
     ok: true,
     auth: {
       apiKey: resolved.apiKey,
+      baseUrl: resolved.baseUrl,
       headers: resolved.headers,
       env: resolved.env,
     },
@@ -48,11 +50,15 @@ export function buildCompatibilityCompletionOptions(
   };
 }
 
+export function modelWithCompatibilityAuth(model: Model<Api>, auth: CompatibilityRequestAuth): Model<Api> {
+  return auth.baseUrl ? { ...model, baseUrl: auth.baseUrl } : model;
+}
+
 export async function completeWithCompatibilityAuth(
   model: Model<Api>,
   context: Context,
   auth: CompatibilityRequestAuth,
   options: SimpleStreamOptions,
 ) {
-  return completeSimple(model, context, buildCompatibilityCompletionOptions(model, auth, options));
+  return completeSimple(modelWithCompatibilityAuth(model, auth), context, buildCompatibilityCompletionOptions(model, auth, options));
 }

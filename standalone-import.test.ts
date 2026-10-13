@@ -29,6 +29,11 @@ async function importStandaloneAddon(slug: "restic" | "a2a" | "autoresearch" | "
       const pinned = rootManifest.devDependencies?.[peerName];
       if (typeof pinned === "string") manifest.devDependencies[peerName] = pinned;
     }
+    const piVersion = rootManifest.devDependencies?.["@earendil-works/pi-coding-agent"];
+    if (typeof piVersion === "string") {
+      manifest.overrides ||= {};
+      for (const name of ["chord", "pi-agent-core", "pi-ai", "pi-coding-agent", "pi-codemode", "pi-mcp", "pi-tui"]) manifest.overrides[`@earendil-works/${name}`] = piVersion;
+    }
     writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
     const installed = Bun.spawnSync(["bun", "install", "--force"], {
       cwd: packageDir,

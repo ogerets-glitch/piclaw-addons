@@ -1,0 +1,7 @@
+# Owned subprocess cleanup
+
+POSIX Delegate children run behind a detached shell session leader. The CLI retains its normal stdin/stdout/stderr; a private status pipe records its exit code separately from the leader's cleanup exit. On natural CLI completion the live leader kills the remaining owned group immediately. Timeout/abort signals the leader, which broadcasts TERM and escalates to group KILL after two seconds. The host never schedules a negative-PGID signal after releasing the leader, avoiding a delayed signal to a reused group.
+
+Already-aborted discovery/execution calls do not spawn. Late progress after rejection is suppressed. If a process outside the group retains inherited pipes after CLI exit, a one-second post-status wait disconnects those readers and rejects rather than waiting indefinitely. This does not kill or contain escaped groups. Unexpected leader death, uninterruptible tasks and hostile process interference are not promised safe termination. Windows retains direct-child termination, not a cross-platform tree-cleanup claim.
+
+Linux regressions cover discovery/execution × timeout/abort, natural exit0/7 with TERM-ignoring descendants, pre-aborted calls and preserved output/exit status. Current local Delegate suite87 pass/7 explicit skips; current Pi1.1 compatibility and synthetic offline protocol checks remain separate from authenticated provider parity. The issue's historical Pi1.0.4 target must not be presented as current qualification.

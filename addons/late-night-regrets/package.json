@@ -51,6 +51,6 @@
   "license": "MIT",
   "homepage": "https://rcarmo.github.io/piclaw-addons/addons/late-night-regrets/",
   "dependencies": {
-    "cron-parser": "5.10.0"
+    "cron-parser": "5.10.2"
   }
 }
