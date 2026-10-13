@@ -5,16 +5,13 @@
  * polling starts at boot when enabled, survives individual session shutdowns
  * and stops through the Piclaw lifecycle API.
  *
- * Inbound text from allowlisted users is queued into one dedicated web chat via
- * `__piclaw_runtime.enqueueAgentMessage`. The pi extension (index.ts) claims
- * the agent run whose prompt contains that text as a message body and hands its
- * final reply back here once the run has settled, including Piclaw's recovery
- * continuations. Only one Telegram message is in flight at a time.
+ * Inbound dispatch requires an injected host provenance capability. The current
+ * runtime has none, so it only sends an unavailable notice. Claims never use text.
+ * Only one Telegram reply obligation is open at a time.
  */
 
 /// <reference path="./grammy.d.ts" />
 
-import { posix } from "node:path";
 import { evaluateUpdate, isDedicatedChatJid, parseAllowedUserIds } from "./gate.js";
 import { isRecoverableTelegramNetworkError } from "./telegram-network-errors.js";
 import { resolveTelegramLongPollTimeoutSeconds } from "./telegram-request-timeouts.js";
@@ -32,19 +29,16 @@ const FAILURE_GRACE_MS = 10 * 60 * 1000;
 const MAX_BACKOFF_MS = 30_000;
 const SEND_ATTEMPTS = 4;
 const MAX_RETRY_AFTER_MS = 10 * 60 * 1000;
-/**
- * Piclaw's neutral recovery prompt (runtime/src/agent-pool/context-pressure-retry.ts).
- * Only this exact text continues a failed claim; if Piclaw changes it, the sender
- * gets the failure notice instead and no unrelated reply is ever forwarded.
- */
-const RECOVERY_CONTINUATION_PROMPTS = new Set(["Continue the current task from persisted state without repeating completed work."]);
-
 export const NOTICES = {
   start: "Connected to Piclaw. Send a plain text message.",
   command: "Commands (/, !) and @mentions are not available over Telegram.",
   unsupported: "Only plain text messages are supported.",
   busy: "Still working on your previous message. Please wait for the reply.",
   failed: "Could not deliver your message to Piclaw.",
+  unknown: "Message admission is uncertain. Check the target web chat; it will not be retried.",
+  unavailable: "Agent access via Telegram is not available yet on this Piclaw version.",
+  sendFailed: "The reply could not be delivered to Telegram. Check the target web chat.",
+  terminal: "Telegram forwarding stopped. The reply to your message will not be forwarded; agent work may still continue in the web chat.",
   noText: "The agent finished without a text reply.",
   aborted: "The agent run was aborted.",
   runFailed: "The agent run failed. Check the target web chat for details.",
@@ -54,10 +48,11 @@ export type TelegramSettings = {
   enabled: boolean;
   allowedUserIds: string[];
   targetChatJid: string;
+  targetIncarnation: string;
   pollingTimeout: number;
 };
 
-const DEFAULT_SETTINGS: TelegramSettings = { enabled: false, allowedUserIds: [], targetChatJid: "", pollingTimeout: 30 };
+const DEFAULT_SETTINGS: TelegramSettings = { enabled: false, allowedUserIds: [], targetChatJid: "", targetIncarnation: "", pollingTimeout: 30 };
 
 export type TelegramApi = {
   getMe(signal?: AbortSignal): Promise<{ id: number; username?: string }>;
@@ -75,8 +70,6 @@ type KvStore = {
 
 type RuntimeApi = {
   lifecycle?: { version: number; onShutdown(handler: () => void | Promise<void>): () => void };
-  enqueueAgentMessage?: (request: { chatJid: string; content: string; mode?: "auto" | "queue" | "steer"; source?: string }) => Promise<{ status?: string }>;
-  messaging?: { version: number; resolveLocalTarget(input: { target_chat_jid: string }): Promise<{ status?: string }> };
 };
 
 type RuntimeInterop = {
@@ -85,7 +78,21 @@ type RuntimeInterop = {
   getChatJid?: (defaultValue?: string) => string;
 };
 
+export type Target = { chatJid: string; incarnation: string };
+export type HostReference = { addonId: string; intentId: string };
+export type ToolContext = { chatJid?: string; chatIncarnation?: string; reference?: HostReference };
+/** Host-bound provenance; the host must recheck lifetime and signal at queue admission. */
+export type HostIngress = {
+  resolveTarget(target: Target, signal: AbortSignal): Promise<Target | null>;
+  enqueue(request: { target: Target; content: string; reference: HostReference }, signal: AbortSignal): Promise<{ status: "accepted"; chatJid: string; incarnation: string }>;
+};
+export type SettingsContext = {
+  listTargets(): Promise<Array<Target & { label: string }>>;
+  resolveTarget(target: Target): Promise<Target | null>;
+};
+
 export type TelegramServiceDeps = {
+  ingress: HostIngress | null;
   runtime: () => RuntimeApi | undefined;
   interop: () => RuntimeInterop | undefined;
   env: Record<string, string | undefined>;
@@ -96,8 +103,8 @@ export type TelegramServiceDeps = {
   log: { info(message: string): void; warn(message: string): void };
 };
 
-type Pending = { runId: number; chatId: number; text: string; createdAt: number; claimedAt: number | null; cancelFailureTimer?: () => void };
-type ActiveRun = { abort: AbortController; api: TelegramApi; loop: Promise<void>; settings: TelegramSettings; token: string };
+type Pending = { runId: number; intentId: string; chatId: number; createdAt: number; claimedAt: number | null; delivering: boolean; cancelFailureTimer?: () => void };
+type ActiveRun = { ingress: AbortController; delivery: AbortController; generation: number; closing: boolean; failed: boolean; sends: Set<Promise<boolean>>; api: TelegramApi; loop: Promise<void>; settings: TelegramSettings; token: string };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -125,63 +132,15 @@ export function parseSettings(value: unknown, base: TelegramSettings = DEFAULT_S
     if (jid === null || (jid !== "" && !isDedicatedChatJid(jid))) return "targetChatJid must be a dedicated web chat (not web:default).";
     next.targetChatJid = jid;
   }
+  if (value.targetIncarnation !== undefined) {
+    if (typeof value.targetIncarnation !== "string") return "targetIncarnation must be a string.";
+    next.targetIncarnation = value.targetIncarnation.trim();
+  }
   if (value.pollingTimeout !== undefined) {
     if (typeof value.pollingTimeout !== "number" || !Number.isFinite(value.pollingTimeout)) return "pollingTimeout must be a number.";
     next.pollingTimeout = Math.max(5, Math.min(120, Math.round(value.pollingTimeout)));
   }
   return next;
-}
-
-const REFERENCE_HEADER = /^(?:files|folders):$/i;
-const REFERENCE_LINE = /^(\s*-\s+)(.+?)\s*$/;
-
-/** Marks the lines Piclaw treats as Files:/Folders: entries (mirrors its prompt formatter). */
-function referenceLines(lines: string[]): boolean[] {
-  let inBlock = false;
-  return lines.map((line) => {
-    const header = line.trim();
-    if (REFERENCE_HEADER.test(header)) { inBlock = true; return false; }
-    if (!inBlock) return false;
-    if (REFERENCE_LINE.test(line)) return true;
-    if (header !== "") inBlock = false;
-    return false;
-  });
-}
-
-function bodyLineMatches(promptLine: string, line: string, isReference: boolean): boolean {
-  const actual = promptLine.trimEnd();
-  if (actual === `  ${line}`.trimEnd()) return true;
-  if (!isReference) return false;
-  // Piclaw rewrites relative reference entries to absolute workspace paths.
-  const [, prefix, value] = REFERENCE_LINE.exec(line)!;
-  if (value.startsWith("/") || /^[a-z][a-z0-9+.-]*:/i.test(value)) return false;
-  const relative = posix.normalize(value.replace(/^\.\//, ""));
-  // Paths escaping the workspace resolve elsewhere; do not guess.
-  if (relative === ".." || relative.startsWith("../")) return false;
-  const rewritten = actual.startsWith(`  ${prefix}/`) ? actual.slice(2 + prefix.length) : "";
-  return rewritten !== "" && posix.normalize(rewritten).endsWith(`/${relative}`);
-}
-
-/**
- * True when `text` appears in `prompt` as a message body: Piclaw's prompt
- * formatter indents every body line by two spaces under a sender header, so
- * header and metadata lines (Channel:, Chat:) never match.
- */
-export function containsMessageBody(prompt: string, text: string): boolean {
-  const promptLines = prompt.split("\n");
-  const allLines = text.replace(/\r\n?/g, "\n").split("\n");
-  const references = referenceLines(allLines);
-  let first = 0;
-  let last = allLines.length - 1;
-  while (first <= last && !allLines[first].trim()) first++;
-  while (last >= first && !allLines[last].trim()) last--;
-  if (first > last) return false;
-  const lines = allLines.slice(first, last + 1);
-  const isReference = references.slice(first, last + 1);
-  for (let start = 0; start + lines.length <= promptLines.length; start++) {
-    if (lines.every((line, offset) => bodyLineMatches(promptLines[start + offset], line, isReference[offset]))) return true;
-  }
-  return false;
 }
 
 /** Splits text into Telegram-sized chunks without breaking surrogate pairs. */
@@ -240,7 +199,10 @@ export class TelegramService {
   private serial: Promise<unknown> = Promise.resolve();
   private pending: Pending | null = null;
   private nextRunId = 1;
-  private offset = 0;
+  private nextOffset = 0;
+  private botId: number | null = null;
+  private generation = 0;
+  private ingress = new AbortController();
   private lifecycleRegistered = false;
   private stopped = false;
 
@@ -266,17 +228,42 @@ export class TelegramService {
     if (ids !== undefined) settings.allowedUserIds = ids ?? [];
     const target = env.PICLAW_TELEGRAM_TARGET_CHAT_JID?.trim();
     if (target !== undefined && target !== "") settings.targetChatJid = isDedicatedChatJid(target) ? target : "";
+    const incarnation = env.PICLAW_TELEGRAM_TARGET_INCARNATION?.trim();
+    if (incarnation !== undefined) settings.targetIncarnation = incarnation;
     const timeout = Number(env.PICLAW_TELEGRAM_POLLING_TIMEOUT);
     if (validTimeout(timeout)) settings.pollingTimeout = timeout;
     return settings;
   }
 
-  saveSettings(payload: unknown): TelegramSettings {
-    const next = parseSettings(payload, this.readStoredSettings());
+  /** Validate before committing and fencing; never retain a request context. */
+  async saveSettings(payload: unknown, context?: SettingsContext | null): Promise<TelegramSettings> {
+    const previous = this.readStoredSettings();
+    const next = parseSettings(payload, previous);
     if (typeof next === "string") throw new Error(`Invalid Telegram settings: ${next}`);
+    const generation = this.generation;
+    const sameSettings = JSON.stringify(previous) === JSON.stringify(next);
+    const unchanged = sameSettings && (!next.enabled || (
+      await this.resolveToken() === this.active?.token && this.active !== null
+      && !this.active.failed && this.live(this.active)
+    ));
+    if (unchanged) return next;
+    const disable = previous.enabled && !next.enabled;
+    if (!context) throw new Error("Verified local context unavailable; Telegram settings were not saved.");
+    if (next.enabled) {
+      if (!next.targetIncarnation) throw new Error("Select a current target chat lifetime.");
+      const target = await context.resolveTarget({ chatJid: next.targetChatJid, incarnation: next.targetIncarnation });
+      if (!target || target.chatJid !== next.targetChatJid || target.incarnation !== next.targetIncarnation) throw new Error("The selected target chat is stale or unavailable.");
+    }
+    if (generation !== this.generation) throw new Error("Telegram lifecycle changed while validating settings; settings were not saved.");
     const kv = this.kv();
     if (!kv) throw new Error("Telegram settings storage is unavailable.");
+    if (this.pending && !disable) throw new Error("Telegram has an open reply obligation. Wait for delivery or disable the channel first.");
+    // Both steps are synchronous: a failed write leaves ingress untouched, and
+    // no admission can interleave between a successful commit and its fence.
     kv.set(ADDON_ID, SETTINGS_KEY, { ...next }, "global");
+    this.fenceIngress();
+    if (disable) await this.stop();
+    else await this.reload();
     return next;
   }
 
@@ -307,27 +294,45 @@ export class TelegramService {
     return token ? message.split(token).join("<redacted>") : message;
   }
 
-  /** Starts polling if every precondition holds. Never throws. */
-  start(): Promise<void> {
-    return this.serialized(() => this.startNow());
+  private fenceIngress(): number {
+    this.generation++;
+    this.ingress.abort();
+    this.active?.ingress.abort();
+    this.ingress = new AbortController();
+    return this.generation;
   }
 
-  /** Stops polling and re-evaluates settings, e.g. after a settings change. */
+  private live(run: ActiveRun): boolean {
+    return run.generation === this.generation && !run.ingress.signal.aborted && !this.stopped;
+  }
+
+  /** A queued start cannot outlive a synchronous lifecycle fence. */
+  start(): Promise<void> {
+    const generation = this.generation;
+    return this.serialized(() => this.startNow(generation));
+  }
+
   reload(): Promise<void> {
+    if (this.pending) return Promise.reject(new Error("Telegram has an open reply obligation. Disable the channel first."));
+    const generation = this.fenceIngress();
     return this.serialized(async () => {
       await this.stopNow();
-      await this.startNow();
+      await this.startNow(generation);
     });
   }
 
   stop(): Promise<void> {
+    this.fenceIngress();
+    if (this.active) this.active.closing = true;
     return this.serialized(() => this.stopNow());
   }
 
-  private async startNow(): Promise<void> {
-    if (this.stopped || this.active) return;
+  private async startNow(generation: number): Promise<void> {
+    const signal = this.ingress.signal;
+    const current = () => generation === this.generation && !signal.aborted && !this.stopped;
+    if (!current() || this.active) return;
     const runtime = this.deps.runtime();
-    if (typeof runtime?.enqueueAgentMessage !== "function" || runtime.lifecycle?.version !== 1 || runtime.messaging?.version !== 1) {
+    if (runtime?.lifecycle?.version !== 1) {
       this.status = "Inactive: this Piclaw version lacks the add-on runtime API";
       return;
     }
@@ -341,32 +346,43 @@ export class TelegramService {
     const settings = this.effectiveSettings();
     if (!settings.enabled) { this.status = "Disabled"; return; }
     if (!settings.allowedUserIds.length) { this.status = "Inactive: no allowed Telegram user IDs"; return; }
-    if (!isDedicatedChatJid(settings.targetChatJid)) { this.status = "Inactive: no dedicated target chat"; return; }
-    if (!(await this.targetExists(settings.targetChatJid))) { this.status = "Inactive: target chat not found"; return; }
+    if (!isDedicatedChatJid(settings.targetChatJid) || !settings.targetIncarnation) { this.status = "Inactive: no dedicated target chat lifetime"; return; }
     const token = await this.resolveToken();
+    if (!current()) return;
     if (!token) { this.status = "Inactive: bot token missing"; return; }
-
     let api: TelegramApi;
     try {
       api = await this.deps.createApi(token);
     } catch {
-      this.status = "Error: Telegram client unavailable";
+      if (current()) this.status = "Error: Telegram client unavailable";
       return;
     }
-    // Update IDs are per bot; never carry a previous bot's offset over.
-    this.offset = 0;
+    if (!current()) return;
     this.status = "Connecting";
-    const run: ActiveRun = { abort: new AbortController(), api, settings, token, loop: Promise.resolve() };
-    run.loop = this.runLoop(run);
+    const run: ActiveRun = { ingress: this.ingress, delivery: new AbortController(), generation, closing: false, failed: false, sends: new Set(), api, settings, token, loop: Promise.resolve() };
     this.active = run;
+    run.loop = this.runLoop(run).finally(() => {
+      if (run.failed && this.active === run) {
+        this.active = null;
+        if (this.ingress === run.ingress) this.ingress = new AbortController();
+        // The rejected token cannot deliver a reply or notice; never leave an obligation stuck.
+        if (this.pending) {
+          this.deps.log.warn("[telegram] Dropping the open reply obligation: Telegram rejected the bot token");
+          this.clearPending();
+        }
+        run.delivery.abort();
+      }
+    });
   }
 
   /** Connects (retrying transient failures) and then long-polls until aborted. */
   private async runLoop(run: ActiveRun): Promise<void> {
-    const signal = run.abort.signal;
+    const signal = run.ingress.signal;
     for (let failures = 1; !signal.aborted; failures++) {
       try {
         const me = await run.api.getMe(signal);
+        if (!this.live(run)) return;
+        if (this.botId !== me.id) { this.botId = me.id; this.nextOffset = 0; }
         this.deps.log.info(`[telegram] Connected as bot ${me.id}`);
         break;
       } catch (error) {
@@ -387,38 +403,38 @@ export class TelegramService {
     if (!isFatal(error)) return false;
     this.status = "Error: Telegram rejected the bot token";
     this.connected = false;
-    run.abort.abort();
+    run.failed = true;
+    run.ingress.abort();
     return true;
   }
 
   private async stopNow(): Promise<void> {
     const run = this.active;
-    this.active = null;
-    this.clearPending();
     this.connected = false;
     if (!run) return;
-    run.abort.abort();
+    run.closing = true;
+    run.ingress.abort();
     await run.loop.catch(() => {});
+    await Promise.allSettled([...run.sends]);
+    if (this.pending) {
+      await this.send(run, this.pending.chatId, NOTICES.terminal);
+      this.clearPending();
+    }
+    run.delivery.abort();
+    if (this.active === run) this.active = null;
     if (!this.stopped) this.status = "Stopped";
-  }
-
-  private async targetExists(chatJid: string): Promise<boolean> {
-    try {
-      const result = await this.deps.runtime()?.messaging?.resolveLocalTarget({ target_chat_jid: chatJid });
-      return result?.status === "resolved";
-    } catch { return false; }
   }
 
   private async pollLoop(run: ActiveRun, activatedAt: number): Promise<void> {
     const allowed = new Set(run.settings.allowedUserIds);
     const timeout = resolveTelegramLongPollTimeoutSeconds(run.settings.pollingTimeout);
     let failures = 0;
-    while (!run.abort.signal.aborted) {
+    while (this.live(run)) {
       let updates: unknown[];
       try {
-        updates = await run.api.getUpdates({ offset: this.offset || undefined, timeout, allowed_updates: ["message"] }, run.abort.signal);
+        updates = await run.api.getUpdates({ offset: this.nextOffset || undefined, timeout, allowed_updates: ["message"] }, run.ingress.signal);
       } catch (error) {
-        if (run.abort.signal.aborted) break;
+        if (run.ingress.signal.aborted) break;
         if (this.failFatal(run, error)) break;
         const code = errorCode(error);
         failures++;
@@ -428,20 +444,23 @@ export class TelegramService {
           this.deps.log.warn(`[telegram] Polling error: ${this.redact(String((error as Error)?.message ?? error), run.token)}`);
         }
         // Honour Telegram's full retry_after; the wait ends early on stop.
-        await this.deps.sleep(retryAfterMs(error) || backoffMs(failures), run.abort.signal);
+        await this.deps.sleep(retryAfterMs(error) || backoffMs(failures), run.ingress.signal);
         continue;
       }
+      if (!this.live(run)) break;
       failures = 0;
       this.connected = true;
       this.status = "Connected";
       for (const update of Array.isArray(updates) ? updates : []) {
-        if (run.abort.signal.aborted) break;
+        if (!this.live(run)) break;
         const updateId = isRecord(update) ? update.update_id : undefined;
-        if (typeof updateId === "number" && Number.isSafeInteger(updateId)) this.offset = Math.max(this.offset, updateId + 1);
+        if (typeof updateId !== "number" || !Number.isSafeInteger(updateId) || updateId < 0 || !Number.isSafeInteger(updateId + 1) || updateId < this.nextOffset) continue;
+        this.nextOffset = updateId + 1;
         await this.handleUpdate(run, update, allowed, activatedAt);
       }
     }
     this.connected = false;
+    if (this.status === "Connected") this.status = "Disconnected";
   }
 
   private async handleUpdate(run: ActiveRun, update: unknown, allowed: ReadonlySet<string>, activatedAt: number): Promise<void> {
@@ -451,61 +470,97 @@ export class TelegramService {
       await this.send(run, decision.chatId, NOTICES[decision.kind], false);
       return;
     }
+    if (!this.deps.ingress) {
+      await this.send(run, decision.chatId, NOTICES.unavailable, false);
+      return;
+    }
     const now = this.deps.now();
-    if (this.pending && !this.isExpired(this.pending, now)) {
-      await this.send(run, decision.chatId, NOTICES.busy, false);
-      return;
+    if (this.pending) {
+      if (!this.isExpired(this.pending, now) || this.pending.delivering) {
+        await this.send(run, decision.chatId, NOTICES.busy, false);
+        return;
+      }
+      await this.deliverReply(run, this.pending, NOTICES.runFailed);
+      if (!this.live(run)) return;
     }
-    this.clearPending();
-    const pending: Pending = { runId: this.nextRunId++, chatId: decision.chatId, text: decision.text, createdAt: now, claimedAt: null };
+    const runId = this.nextRunId++;
+    const pending: Pending = { runId, intentId: crypto.randomUUID(), chatId: decision.chatId, createdAt: now, claimedAt: null, delivering: false };
     this.pending = pending;
+    const target = { chatJid: run.settings.targetChatJid, incarnation: run.settings.targetIncarnation };
+    let attempted = false;
     try {
-      if (!(await this.targetExists(run.settings.targetChatJid))) throw new Error("target chat not found");
-      const result = await this.deps.runtime()!.enqueueAgentMessage!({
-        chatJid: run.settings.targetChatJid,
-        content: decision.text,
-        mode: "queue",
-        source: "telegram",
-      });
-      if (result?.status !== "ok") throw new Error("enqueue not accepted");
+      const resolved = await this.deps.ingress.resolveTarget(target, run.ingress.signal);
+      if (!this.live(run)) {
+        if (!run.closing) await this.deliverReply(run, pending, NOTICES.failed);
+        return;
+      }
+      if (!resolved || resolved.chatJid !== target.chatJid || resolved.incarnation !== target.incarnation) throw new Error("target chat lifetime not found");
+      attempted = true;
+      const result = await this.deps.ingress.enqueue({ target, content: decision.text, reference: { addonId: ADDON_ID, intentId: pending.intentId } }, run.ingress.signal);
+      if (result.status !== "accepted" || result.chatJid !== target.chatJid || result.incarnation !== target.incarnation) throw new Error("unverified receipt");
+      // A verified receipt remains an obligation even if the ingress fence won.
+      if (!this.live(run)) return;
     } catch (error) {
-      if (this.pending === pending) this.clearPending();
-      this.deps.log.warn(`[telegram] Delivery to ${run.settings.targetChatJid} failed: ${String((error as Error)?.message ?? error)}`);
-      await this.send(run, decision.chatId, NOTICES.failed, false);
+      if (run.closing) return;
+      // No automatic retries, including uncertain admission outcomes.
+      const rejected = isRecord(error) && error.delivery === "rejected";
+      await this.deliverReply(run, pending, attempted && !rejected ? NOTICES.unknown : NOTICES.failed);
       return;
     }
-    run.api.sendChatAction(decision.chatId, "typing", undefined, run.abort.signal).catch(() => {});
+    if (this.live(run)) {
+      const typing = run.api.sendChatAction(decision.chatId, "typing", undefined, run.delivery.signal).then(() => true, () => false);
+      run.sends.add(typing);
+      void typing.then(() => run.sends.delete(typing));
+    }
   }
 
   /**
-   * Notices from the poll loop are sent once so they never stall polling; agent
-   * replies (sent outside the loop) retry rate limits, server errors and
-   * transient network failures, honouring Telegram's retry_after.
+   * Local gate notices are sent once; replies and terminal notices retry rate
+   * limits, server errors and transient network failures, honouring retry_after.
    */
-  private async send(run: ActiveRun, chatId: number, text: string, retry = true): Promise<boolean> {
-    for (const chunk of splitMessage(text)) {
-      if (!(await this.sendChunk(run, chatId, chunk, retry ? SEND_ATTEMPTS : 1))) return false;
-    }
-    return true;
+  private send(run: ActiveRun, chatId: number, text: string, retry = true, reply = false): Promise<boolean> {
+    const delivery = (async () => {
+      for (const chunk of splitMessage(text)) {
+        if (reply && run.closing) return false;
+        if (!(await this.sendChunk(run, chatId, chunk, retry ? SEND_ATTEMPTS : 1, reply))) return false;
+      }
+      return true;
+    })();
+    run.sends.add(delivery);
+    void delivery.then(() => run.sends.delete(delivery), () => run.sends.delete(delivery));
+    return delivery;
   }
 
-  private async sendChunk(run: ActiveRun, chatId: number, chunk: string, attempts: number): Promise<boolean> {
-    for (let attempt = 1; !run.abort.signal.aborted; attempt++) {
+  private async sendChunk(run: ActiveRun, chatId: number, chunk: string, attempts: number, reply: boolean): Promise<boolean> {
+    const signal = run.delivery.signal;
+    for (let attempt = 1; !signal.aborted && !(reply && run.closing); attempt++) {
       try {
-        await run.api.sendMessage(chatId, chunk, { link_preview_options: { is_disabled: true } }, run.abort.signal);
+        await run.api.sendMessage(chatId, chunk, { link_preview_options: { is_disabled: true } }, signal);
         return true;
       } catch (error) {
         const code = errorCode(error);
         const retryable = code === 429 || code >= 500 || (!code && isRecoverableTelegramNetworkError(error));
         const wait = retryAfterMs(error) || backoffMs(attempt - 1);
-        if (!retryable || attempt >= attempts || wait > MAX_RETRY_AFTER_MS || run.abort.signal.aborted) {
+        if (!retryable || attempt >= attempts || wait > MAX_RETRY_AFTER_MS || signal.aborted || (reply && run.closing)) {
           this.deps.log.warn(`[telegram] Send failed: ${this.redact(String((error as Error)?.message ?? error), run.token)}`);
           return false;
         }
-        await this.deps.sleep(wait, run.abort.signal);
+        try { await this.deps.sleep(wait, signal); } catch { return false; }
       }
     }
     return false;
+  }
+
+  private async deliverReply(run: ActiveRun, pending: Pending, text: string): Promise<void> {
+    if (pending.delivering) return;
+    pending.cancelFailureTimer?.();
+    pending.cancelFailureTimer = undefined;
+    pending.delivering = true;
+    const sent = await this.send(run, pending.chatId, text, true, true).catch(() => false);
+    // Stop owns the terminal notice and clearing, even if a final chunk finished.
+    if (run.closing) return;
+    if (!sent) await this.send(run, pending.chatId, NOTICES.sendFailed, false);
+    if (this.pending === pending) this.clearPending();
   }
 
   private isExpired(pending: Pending, now: number): boolean {
@@ -519,28 +574,29 @@ export class TelegramService {
     this.pending = null;
   }
 
-  /**
-   * Called from the pi extension when an agent run starts. Returns a run ID when
-   * the run belongs to the in-flight Telegram message, otherwise null.
-   */
-  claimRun(chatJid: string, prompt: unknown): number | null {
+  private matches(run: ActiveRun, pending: Pending, context?: ToolContext | null): boolean {
+    return context?.reference?.addonId === ADDON_ID && context.reference.intentId === pending.intentId
+      && context.chatJid === run.settings.targetChatJid && context.chatIncarnation === run.settings.targetIncarnation;
+  }
+
+  /** Only host-bound reference and exact target lifetime can claim an intent. */
+  claimRun(chatJid: string, context?: ToolContext | null): number | null {
     const run = this.active;
     const pending = this.pending;
-    if (!run || !pending || pending.claimedAt !== null || chatJid !== run.settings.targetChatJid || typeof prompt !== "string") return null;
-    if (this.isExpired(pending, this.deps.now())) { this.clearPending(); return null; }
-    if (!containsMessageBody(prompt, pending.text)) return null;
+    if (!run || !pending || run.closing || pending.delivering || pending.claimedAt !== null || chatJid !== run.settings.targetChatJid || !this.matches(run, pending, context)) return null;
+    if (this.isExpired(pending, this.deps.now())) {
+      void this.deliverReply(run, pending, NOTICES.runFailed);
+      return null;
+    }
     pending.claimedAt = this.deps.now();
     return pending.runId;
   }
 
-  /**
-   * After a failed attempt, Piclaw's recovery continuation in the claiming
-   * session keeps the claim open. Any other prompt is a different turn.
-   */
-  continueRun(runId: number, prompt: unknown): boolean {
+  /** Recovery is eligible only with the same host-bound reference and lifetime. */
+  continueRun(runId: number, context?: ToolContext | null): boolean {
+    const run = this.active;
     const pending = this.pending;
-    if (!this.active || pending?.runId !== runId || !pending.cancelFailureTimer) return false;
-    if (typeof prompt !== "string" || !RECOVERY_CONTINUATION_PROMPTS.has(prompt)) return false;
+    if (!run || run.closing || pending?.runId !== runId || !pending.cancelFailureTimer || !this.matches(run, pending, context)) return false;
     pending.cancelFailureTimer();
     pending.cancelFailureTimer = undefined;
     return true;
@@ -553,19 +609,17 @@ export class TelegramService {
   async completeRun(runId: number, text: string | null, aborted: boolean): Promise<void> {
     const run = this.active;
     const pending = this.pending;
-    if (!run || !pending || pending.runId !== runId) return;
+    if (!run || run.closing || !pending || pending.delivering || pending.runId !== runId) return;
     if (text === null && !aborted) {
       pending.cancelFailureTimer?.();
       pending.cancelFailureTimer = this.deps.setTimer(FAILURE_GRACE_MS, () => {
         if (this.pending !== pending || this.active !== run) return;
-        this.pending = null;
-        void this.send(run, pending.chatId, NOTICES.runFailed);
+        void this.deliverReply(run, pending, NOTICES.runFailed);
       });
       return;
     }
-    this.clearPending();
     const reply = text === null ? "" : stripInternal(text);
-    await this.send(run, pending.chatId, reply || (aborted ? NOTICES.aborted : NOTICES.noText));
+    await this.deliverReply(run, pending, reply || (aborted ? NOTICES.aborted : NOTICES.noText));
   }
 
   async view(): Promise<Record<string, unknown>> {
@@ -582,9 +636,10 @@ export class TelegramService {
 
 type PiclawHost = typeof globalThis & { __piclaw_runtime?: RuntimeApi; __piclawRuntimeInterop?: RuntimeInterop };
 
-function defaultDeps(): TelegramServiceDeps {
+function defaultDeps(ingress: HostIngress | null): TelegramServiceDeps {
   const host = globalThis as PiclawHost;
   return {
+    ingress,
     runtime: () => host.__piclaw_runtime,
     interop: () => host.__piclawRuntimeInterop,
     env: process.env,
@@ -609,9 +664,9 @@ function defaultDeps(): TelegramServiceDeps {
 }
 
 /** One service per process, shared by the runtime entry and every pi session. */
-export function getTelegramService(): TelegramService {
+export function getTelegramService(options: { ingress: HostIngress | null }): TelegramService {
   const host = globalThis as Record<symbol, TelegramService | undefined>;
-  return (host[SERVICE_KEY] ??= new TelegramService(defaultDeps()));
+  return (host[SERVICE_KEY] ??= new TelegramService(defaultDeps(options.ingress)));
 }
 
 export function peekTelegramService(): TelegramService | undefined {

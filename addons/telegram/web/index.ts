@@ -42,6 +42,7 @@ function TelegramSettings() {
   const [enabled, setEnabled] = useState(false);
   const [allowedUserIds, setAllowedUserIds] = useState("");
   const [targetChatJid, setTargetChatJid] = useState("");
+  const [targetIncarnation, setTargetIncarnation] = useState("");
   const [pollingTimeout, setPollingTimeout] = useState(30);
 
   const loadConfig = useCallback(async () => {
@@ -55,6 +56,7 @@ function TelegramSettings() {
         setEnabled(data.enabled ?? false);
         setAllowedUserIds(Array.isArray(data.allowedUserIds) ? data.allowedUserIds.join(", ") : "");
         setTargetChatJid(data.targetChatJid ?? "");
+        setTargetIncarnation(data.targetIncarnation ?? "");
         setPollingTimeout(data.pollingTimeout ?? 30);
       }
     } catch { /* ignore */ }
@@ -68,19 +70,22 @@ function TelegramSettings() {
     try {
       const nextToken = botToken.trim();
       if (nextToken && !(await saveKeychainToken(nextToken))) throw new Error("Failed to save Telegram token to keychain.");
-      const body: any = { enabled, allowedUserIds, targetChatJid, pollingTimeout };
+      const body: any = { enabled, allowedUserIds, targetChatJid, targetIncarnation, pollingTimeout };
       const res = await fetch(`/agent/addons/api/${ADDON_ID}/config`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
-      if (!res.ok) throw new Error("Save failed. Check the user IDs and the target chat.");
       const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Save failed. Check the user IDs and the target chat.");
       setConfig({ ...data, botTokenConfigured: data.botTokenConfigured || Boolean(nextToken) || config.botTokenConfigured });
       setBotToken("");
-    } catch (err: any) { setError(err?.message || "Save failed."); }
+    } catch (err: any) {
+      setError(err?.message || "Save failed.");
+      await loadConfig();
+    }
     setSaving(false);
-  }, [botToken, config.botTokenConfigured, enabled, allowedUserIds, targetChatJid, pollingTimeout]);
+  }, [botToken, config.botTokenConfigured, enabled, allowedUserIds, targetChatJid, targetIncarnation, pollingTimeout, loadConfig]);
 
   return html`
     <section data-settings-addon="telegram">
@@ -121,13 +126,15 @@ function TelegramSettings() {
 
       <div class="settings-addon-field">
         <label class="settings-addon-label" for="telegram-target">Target chat</label>
-        ${config.targets?.length
-          ? html`<select class="settings-addon-control" id="telegram-target" value=${targetChatJid} onChange=${(e: any) => setTargetChatJid(e.target.value)}>
-              <option value="">Select a dedicated chat</option>
-              ${config.targets.map((t: any) => html`<option value=${t.chatJid}>${t.label || t.chatJid}</option>`)}
-            </select>`
-          : html`<input class="settings-addon-control" id="telegram-target" type="text" value=${targetChatJid} placeholder="web:telegram" onInput=${(e: any) => setTargetChatJid(e.target.value)} />`}
-        <span class="settings-addon-help">An existing web chat used only for Telegram (not web:default). Its replies to Telegram messages are sent back to the sender.</span>
+        <select class="settings-addon-control" id="telegram-target" value=${JSON.stringify([targetChatJid, targetIncarnation])} onChange=${(e: any) => {
+          const [jid, incarnation] = JSON.parse(e.target.value);
+          setTargetChatJid(jid);
+          setTargetIncarnation(incarnation);
+        }}>
+          <option value=${JSON.stringify(["", ""])}>Select a dedicated chat</option>
+          ${(config.targets || []).map((t: any) => html`<option value=${JSON.stringify([t.chatJid, t.incarnation])}>${t.label || t.chatJid} — ${t.incarnation.slice(0, 8)} (${t.chatJid})</option>`)}
+        </select>
+        <span class="settings-addon-help">An existing web chat used only for Telegram (not web:default). Inbound agent access is currently unavailable; no messages are forwarded to the agent.</span>
       </div>
 
       <div class="settings-addon-field">
@@ -156,7 +163,7 @@ function TelegramSettings() {
 
       <p style="font-size: 11px; color: var(--text-secondary, #71767b); margin-top: 12px;">
         Create a bot via <a href="https://t.me/BotFather" target="_blank" style="color: var(--accent, #1d9bf0);">@BotFather</a> on Telegram. The token is stored in keychain entry <code>${BOT_TOKEN_KEYCHAIN}</code>. Saving applies the settings immediately.
-        Allowed users get the same agent and tool rights as the target web chat.
+        Inbound agent access is disabled until Piclaw supports unattended host-bound dispatch.
       </p>
     </section>
   `;

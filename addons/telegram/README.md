@@ -1,62 +1,107 @@
 # Telegram integration
 
-Telegram is an **optional secondary channel** for mobile-first chat access.
-The web UI remains the primary interface.
-
+Telegram is an **optional secondary channel**. The web UI remains the primary interface.
 Requires Piclaw `>=3.3.2` in single-user mode.
 
-## How it works
+## Inbound agent access is currently disabled
 
-- A startup runtime entry long-polls the Bot API from Piclaw boot onwards. Polling does not depend on an open web UI or agent session, and individual session shutdowns do not disconnect it.
-- Text from an allowlisted user is queued into one **dedicated web chat** (for example `web:telegram`) through the Piclaw runtime API. The final reply of that agent run is sent back to the sender once the run has settled, including after automatic retries and Piclaw recovery continuations. If a run fails and no recovery follows within ten minutes, the sender gets a short failure notice; the details stay in the web chat.
-- One Telegram message is processed at a time. A second message sent while a reply is pending gets a short "still working" notice instead of being queued.
-- Other activity in the target chat (web messages, side prompts, scheduled runs) is not mirrored to Telegram.
+Version 0.3.0 is fail-closed: the current Piclaw runtime has no supported unattended
+capability combining exact target-lifetime admission, cancellation and host-bound
+message references. Allowlisted plain text gets:
 
-## Access control (fail closed)
+> Agent access via Telegram is not available yet on this Piclaw version.
 
-Only these messages are accepted:
+Nothing is enqueued to the agent. See the PR discussion about the pending host
+capability. There is no fallback to raw enqueue, prompt-text matching, source
+strings or session IDs. The browser-only `localContext.enqueue` cannot be retained
+by the background poller. The injected ingress interface is exercised by tests;
+the startup runtime supplies `ingress: null`.
 
-- plain text `message` updates (edits, channel posts and other update types are ignored);
-- from a non-bot user whose numeric ID is on the allowlist;
-- in that user's own private chat (no groups, supergroups, forum topics, anonymous senders or forwarded messages);
-- sent after polling started, so nothing sent while Piclaw was down is replayed.
+Polling starts independently of agent sessions and can answer local notices.
+If a future supported ingress is integrated, only a matching host-provided
+`{addonId, intentId}`, chat JID and incarnation can claim a reply. Other web,
+side-session or scheduled activity is never mirrored. One reply obligation is
+open at a time, including while sending a multipart or retrying reply.
 
-Messages from anyone else are ignored without a reply. An allowlisted user who sends something other than plain text (a photo, sticker or file) gets a short "only plain text" notice. If no user IDs or no dedicated target chat are configured, polling does not start. Slash commands, the `!` shell alias and `@mentions` are refused over Telegram because they would run immediately or route to another chat.
+Recovery also requires the same host reference and lifetime. Host references
+belong only to the admitted prompt, so ordinary recovery prompts usually lack
+one; they cannot inherit ownership by matching a neutral prompt string. A failed
+claimed attempt without provenanced recovery gets a failure notice after ten
+minutes. Ingress admission with an uncertain result is never automatically retried;
+the sender gets an uncertainty notice pointing to the web chat, unless stop/disable
+owns the terminal notice. An interrupted admission without a verified receipt
+gets a failure or uncertainty notice and releases the obligation.
 
-Allowed users get the same agent and tool rights as the target web chat. Only allowlist accounts you control.
+## Access control
 
-## Enable
+Only new plain text `message` updates from an allowlisted non-bot user in that
+user's own private chat are accepted. Edits, channel posts, groups, anonymous
+senders and forwarded messages are ignored. Messages sent before polling
+activation are ignored, including messages sent while Piclaw was down.
+
+Strangers receive no reply. Allowlisted users get local notices for unsupported
+messages or commands. Slash commands, the `!` shell alias and `@mentions` are
+refused. No allowlist or no dedicated target lifetime means no polling.
+
+Update IDs must be safe nonnegative integers with a safe successor. Duplicates
+and IDs below the high-water offset are dropped before authorization or notices;
+valid ignored updates also advance the offset. The offset is retained in memory
+across reloads and token rotation for the same bot ID returned by `getMe`; a bot
+change resets it. A process restart loses the offset; the activation-time filter
+still prevents replay of older messages. This is not durable exactly-once delivery.
+
+## Configure
 
 1. Create a bot with [@BotFather](https://t.me/BotFather).
-2. Create a web chat that will be used only for Telegram.
-3. Open **Settings → Telegram**, enter the bot token, your numeric Telegram user ID and the target chat, enable the channel and save. Settings apply immediately and are restored at every start.
+2. Create a dedicated web chat (not `web:default`).
+3. Open **Settings → Telegram**, enter the token and allowed numeric user IDs,
+   select the target branch, enable polling and save.
 
-The token is stored in the Piclaw keychain as `telegram/bot-token`. Non-secret settings are stored in global extension KV.
+The picker lists sibling branches separately, with their incarnation and JID.
+Settings persist both `targetChatJid` and `targetIncarnation`. Material saves
+require verified local request context; enabling also requires exact target
+resolution. A deleted/recreated chat rejects an enabled save, but never blocks
+disabling. Rejected saves leave the running poller untouched. Older settings
+without an incarnation must be reselected in Settings before polling can start.
 
-Environment overrides are also supported:
+The token is stored in keychain entry `telegram/bot-token`. Non-secret settings
+are stored in global extension KV. Token lookup order is `TELEGRAM_BOT_TOKEN`,
+`PICLAW_TELEGRAM_BOT_TOKEN`, keychain, then legacy KV. New tokens are written only
+to the keychain. Environment overrides are supported:
 
 ```bash
 PICLAW_TELEGRAM_ENABLED=1
 TELEGRAM_BOT_TOKEN=123456789:your_botfather_token
 PICLAW_TELEGRAM_ALLOWED_USER_IDS=123456789
 PICLAW_TELEGRAM_TARGET_CHAT_JID=web:telegram
+PICLAW_TELEGRAM_TARGET_INCARNATION=existing-branch-id
 PICLAW_TELEGRAM_POLLING_TIMEOUT=30
 ```
 
-Token lookup order: `TELEGRAM_BOT_TOKEN`, `PICLAW_TELEGRAM_BOT_TOKEN`, keychain `telegram/bot-token`, then a legacy KV-stored token. New secrets are written only to the keychain.
+Allowed users would have the same agent/tool rights as the selected web chat
+once host ingress is supported. Only allowlist accounts you control.
 
-## Upgrading from 0.1.x
+## Saving, stopping and disabling
 
-Version 0.1.x stored `enabled` and `pollingTimeout` outside the new settings record and accepted messages from anyone. After upgrading, open **Settings → Telegram**, add the allowed user IDs and the target chat, and save. Until then the channel stays off.
+A no-op settings save with the same active token does not restart polling or
+interrupt a reply. Keychain token changes take effect on save. Any material change
+or reload with an open reply obligation is rejected visibly without fencing
+ingress. Wait for delivery, or explicitly disable first. An enabled-to-disabled
+save is the exception: it is an explicit stop.
 
-## Disable
+Stop/disable fences admission and polling synchronously. Telegram delivery has a
+separate lifetime: an already-started send or retry wait drains before the old
+transport closes. Remaining reply chunks/retries are not forwarded. Every open
+obligation receives the terminal notice (subject to Telegram transport failure):
 
-Disable the channel in **Settings → Telegram** and save; polling stops immediately. Unsetting `PICLAW_TELEGRAM_ENABLED` disables environment-based enablement but does not override an enabled value saved through Settings.
+> Telegram forwarding stopped. The reply to your message will not be forwarded;
+> agent work may still continue in the web chat.
 
-## Settings field appearance (0.1.3)
+A reply send failure instead gets a single delivery-failure notice, without
+retrying that notice. The terminal notice is reserved for stop/disable.
 
-Text-like fields use the host's shared `settings-addon-*` controls and associated
-labels, matching core Settings in Classic and Visual without changing save
-payloads, defaults or secret handling. A package-local layered stylesheet keeps
-older supported hosts readable; host rules take precedence when available.
-Native checkboxes and action buttons retain their own control roles.
+This does **not** claim that agent work was aborted. Disabling via Settings does
+not override `PICLAW_TELEGRAM_ENABLED=1` on a later start; unset that override too.
+
+Text-like settings controls use the host's shared `settings-addon-*` styling,
+with a package-local fallback for older hosts. Tokens remain keychain-only.

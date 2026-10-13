@@ -5,9 +5,9 @@
  * It registers the Settings config API and restores polling from saved
  * settings. Missing configuration leaves the channel inactive; it never throws.
  */
-import { ADDON_ID, getTelegramService } from "./service.js";
+import { ADDON_ID, getTelegramService, type SettingsContext } from "./service.js";
 
-type LocalContext = { listTargets?: () => Promise<Array<{ chatJid?: unknown; label?: unknown }>> };
+type LocalContext = SettingsContext;
 
 type AddonConfigApiRegistrar = (
   addonId: string,
@@ -19,15 +19,16 @@ type AddonConfigApiRegistrar = (
   extensionPath?: string,
 ) => "created" | "updated";
 
-const service = getTelegramService();
+// Browser localContext is request-scoped, not an unattended ingress capability.
+const service = getTelegramService({ ingress: null });
 
 /** Dedicated web chats offered in the Settings picker, when the host provides them. */
 async function listTargets(context?: LocalContext | null) {
   try {
     const targets = (await context?.listTargets?.()) ?? [];
     return targets
-      .filter((target) => typeof target.chatJid === "string" && target.chatJid.startsWith("web:") && target.chatJid !== "web:default")
-      .map((target) => ({ chatJid: target.chatJid as string, label: typeof target.label === "string" ? target.label : target.chatJid as string }));
+      .filter((target) => typeof target.chatJid === "string" && target.chatJid.startsWith("web:") && target.chatJid !== "web:default" && typeof target.incarnation === "string" && target.incarnation !== "")
+      .map((target) => ({ chatJid: target.chatJid as string, incarnation: target.incarnation, label: typeof target.label === "string" ? target.label : target.chatJid as string }));
   } catch { return []; }
 }
 
@@ -36,8 +37,7 @@ if (typeof registerAddonConfigApi === "function") {
   registerAddonConfigApi(ADDON_ID, "config", {
     get: async (_payload, _req, context) => ({ ...(await service.view()), targets: await listTargets(context) }),
     set: async (payload, _req, context) => {
-      service.saveSettings(payload);
-      await service.reload();
+      await service.saveSettings(payload, context);
       return { ok: true, ...(await service.view()), targets: await listTargets(context) };
     },
   }, import.meta.dir);

@@ -8,7 +8,7 @@
  * Telegram. Session start or shutdown never connects or disconnects the channel.
  */
 import type { ExtensionAPI, ExtensionFactory } from "@earendil-works/pi-coding-agent";
-import { peekTelegramService } from "./service.js";
+import { peekTelegramService, type ToolContext } from "./service.js";
 
 type AgentMessageLike = { role?: string; content?: unknown; stopReason?: string };
 
@@ -33,6 +33,11 @@ function currentChatJid(): string {
   try { return interop?.getChatJid?.("") || ""; } catch { return ""; }
 }
 
+function toolContext(): ToolContext | null {
+  const local = (globalThis as { __piclaw_runtime?: { localContext?: { version?: number; getToolContext?: () => ToolContext | null } } }).__piclaw_runtime?.localContext;
+  try { return local?.version === 1 ? local.getToolContext?.() ?? null : null; } catch { return null; }
+}
+
 const register: ExtensionFactory = (pi: ExtensionAPI) => {
   // Per-session state: side sessions get their own factory instance and never see this claim.
   let claimed: number | null = null;
@@ -46,14 +51,15 @@ const register: ExtensionFactory = (pi: ExtensionAPI) => {
     void peekTelegramService()?.completeRun(runId, lastText, aborted).catch(() => {});
   };
 
-  pi.on("before_agent_start", (event) => {
+  pi.on("before_agent_start", () => {
+    const context = toolContext();
     const service = peekTelegramService();
     if (claimed !== null) {
-      // Piclaw re-prompts the same session with a neutral continuation after a failed attempt.
-      if (service?.continueRun(claimed, event.prompt)) return;
+      // Recovery without host provenance cannot inherit the claim.
+      if (service?.continueRun(claimed, context)) return;
       claimed = null;
     }
-    const runId = service?.claimRun(currentChatJid(), event.prompt) ?? null;
+    const runId = service?.claimRun(currentChatJid(), context) ?? null;
     if (runId !== null) {
       claimed = runId;
       lastText = null;
