@@ -1,3 +1,5 @@
+import { lateNightRegretsIcon } from './icon';
+
 type ModelOption = { id: string; name: string };
 interface Config {
   enabled: boolean;
@@ -159,7 +161,7 @@ function register() {
   globals.__piclawSettingsPaneRegistry.registerSettingsPane({
     id: "late-night-regrets",
     label: "Late Night Regrets",
-    icon: null,
+    icon: lateNightRegretsIcon,
     order: 70,
     searchable: true,
     component: RegretsSettings,
