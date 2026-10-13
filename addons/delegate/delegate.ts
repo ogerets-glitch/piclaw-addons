@@ -932,18 +932,61 @@ export function parsePiListModelsOutput(output: string): AvailableModel[] {
   return models;
 }
 
+/**
+ * A POSIX session leader anchors the owned group through TERM escalation.
+ * Only that live leader broadcasts signals to its own group, so no delayed
+ * negative-PID kill can target a reused group after the CLI parent exits.
+ * Windows retains the existing direct-child termination convention.
+ */
+const DELEGATE_GROUP_ANCHOR = `
+trap 'trap "" TERM; kill -TERM -$$; sleep 2; kill -KILL -$$' TERM
+trap 'trap "" TERM USR1; kill -KILL -$$' USR1
+exec 4<&0
+"$@" <&4 3>&- 4<&- &
+delegate_child=$!
+exec 4<&-
+wait "$delegate_child"
+delegate_status=$?
+printf "%s\\n" "$delegate_status" >&3
+exec 3>&-
+# Retain the group identity until the host requests owned-group cleanup.
+while :; do sleep 3600 & wait $!; done
+`;
+
+function spawnDelegateChild(command: string, args: string[], stdin: "ignore" | "pipe", onCliExit: () => void) {
+  const posix = process.platform !== "win32";
+  const child = nodeSpawn(posix ? "/bin/sh" : command,
+    posix ? ["-c", DELEGATE_GROUP_ANCHOR, "delegate-group", command, ...args] : args, {
+      cwd: getDelegateWorkspaceRoot(),
+      stdio: posix ? [stdin, "pipe", "pipe", "pipe"] : [stdin, "pipe", "pipe"],
+      env: process.env,
+      detached: posix,
+    });
+  const owned = { child, cliExitCode: null as number | null };
+  let status = "";
+  child.stdio[3]?.on("data", (chunk: Buffer) => {
+    if (owned.cliExitCode !== null) return;
+    status += chunk.toString();
+    if (!/^\d{1,3}\n$/.test(status)) return;
+    const code = Number(status.trim());
+    if (code > 255) return;
+    owned.cliExitCode = code;
+    onCliExit();
+    // Signal only the still-owned child. The live anchor performs both group
+    // signals itself; the host never schedules a kill against a saved PGID.
+    child.kill("SIGUSR1");
+  });
+  return owned;
+}
+
 function runPiListModels(cli: DelegateCliCommand, timeoutMs = 20_000, signal?: AbortSignal): Promise<string> {
   return new Promise((resolvePromise, reject) => {
     if (signal?.aborted) {
       reject(new Error("Aborted during Delegate model discovery"));
       return;
     }
-    const child = nodeSpawn(cli.command, [...cli.argsPrefix, "--list-models"], {
-      cwd: getDelegateWorkspaceRoot(),
-      stdio: ["ignore", "pipe", "pipe"],
-      env: process.env,
-      detached: process.platform !== "win32",
-    });
+    const owned = spawnDelegateChild(cli.command, [...cli.argsPrefix, "--list-models"], "ignore", () => { cleanup(); forceTimer = setTimeout(() => { if(settled)return; settled=true; child.stdout?.destroy();child.stderr?.destroy();reject(new Error("Delegate model discovery retained pipes after CLI exit.")); }, 1000); });
+    const { child } = owned;
     let stdout = "";
     let stderr = "";
     let settled = false;
@@ -952,9 +995,6 @@ function runPiListModels(cli: DelegateCliCommand, timeoutMs = 20_000, signal?: A
     let forceTimer: ReturnType<typeof setTimeout> | null = null;
 
     const sendSignal = (childSignal: NodeJS.Signals) => {
-      if (process.platform !== "win32" && child.pid) {
-        try { process.kill(-child.pid, childSignal); return; } catch { /* fall through */ }
-      }
       try { child.kill(childSignal); } catch { /* already exited */ }
     };
     const cleanup = () => {
@@ -967,7 +1007,13 @@ function runPiListModels(cli: DelegateCliCommand, timeoutMs = 20_000, signal?: A
       if (settled || terminationError) return;
       terminationError = error;
       sendSignal("SIGTERM");
-      killTimer = setTimeout(() => sendSignal("SIGKILL"), 2_000);
+      if (process.platform !== "win32") {
+        settled = true;
+        cleanup();
+        reject(error);
+        return;
+      }
+      if (process.platform === "win32") killTimer = setTimeout(() => sendSignal("SIGKILL"), 2_000);
       forceTimer = setTimeout(() => {
         if (settled) return;
         settled = true;
@@ -990,7 +1036,7 @@ function runPiListModels(cli: DelegateCliCommand, timeoutMs = 20_000, signal?: A
       settled = true;
       cleanup();
       if (terminationError) reject(terminationError);
-      else if (code !== 0) reject(new Error(stderr.trim() || `${cli.label} --list-models exited ${code}`));
+      else if ((owned.cliExitCode ?? code) !== 0) reject(new Error(stderr.trim() || `${cli.label} --list-models exited ${owned.cliExitCode ?? code}`));
       else resolvePromise(stdout);
     });
     child.on("error", (error) => {
@@ -1980,7 +2026,8 @@ export function delegateProcessFailure(processResult: DelegateProcessResult): st
   return failures.length > 0 ? [...new Set(failures)].join("; ") : null;
 }
 
-/** Run Pi JSON mode as an ephemeral child process with one deadline and process-tree cleanup. */
+/** Run Pi JSON mode with a CLI deadline and cleanup of its owned POSIX group.
+ * Descendants that escape that group are not covered. */
 export function runDelegateProcess(
   piArgs: string[],
   prompt: string,
@@ -1990,14 +2037,16 @@ export function runDelegateProcess(
   cliOverride?: DelegateCliOverride,
 ): Promise<DelegateProcessResult> {
   return new Promise((resolvePromise, reject) => {
+    if (signal?.aborted) {
+      const error = new Error("Aborted");
+      error.name = "AbortError";
+      reject(error);
+      return;
+    }
     const resolvedCli = cliOverride ?? resolveDelegateCliCommand();
-    const child = nodeSpawn(resolvedCli.command, [...(resolvedCli.argsPrefix ?? []), ...piArgs], {
-      cwd: getDelegateWorkspaceRoot(),
-      stdio: ["pipe", "pipe", "pipe"],
-      env: process.env,
-      detached: process.platform !== "win32",
-    });
-    const accumulator = new DelegateJsonAccumulator(onProgress);
+    const owned = spawnDelegateChild(resolvedCli.command, [...(resolvedCli.argsPrefix ?? []), ...piArgs], "pipe", () => { cleanup(); forceSettleTimer = setTimeout(() => { if(settled)return; settled=true; child.stdout?.destroy();child.stderr?.destroy();reject(new Error("Delegate retained pipes after CLI exit.")); }, 1000); });
+    const { child } = owned;
+    const accumulator = new DelegateJsonAccumulator(event => { if (!settled && !terminationError) onProgress?.(event); });
     const decoder = new StringDecoder("utf8");
     let lineBuffer = "";
     let stderr = "";
@@ -2038,9 +2087,6 @@ export function runDelegateProcess(
     }
 
     function sendSignal(childSignal: NodeJS.Signals): void {
-      if (process.platform !== "win32" && child.pid) {
-        try { process.kill(-child.pid, childSignal); return; } catch { /* fall through */ }
-      }
       try { child.kill(childSignal); } catch { /* already exited */ }
     }
 
@@ -2048,7 +2094,13 @@ export function runDelegateProcess(
       if (settled || terminationError) return;
       terminationError = error;
       sendSignal("SIGTERM");
-      killTimer = setTimeout(() => sendSignal("SIGKILL"), 2_000);
+      if (process.platform !== "win32") {
+        settled = true;
+        cleanup();
+        reject(error);
+        return;
+      }
+      if (process.platform === "win32") killTimer = setTimeout(() => sendSignal("SIGKILL"), 2_000);
       forceSettleTimer = setTimeout(() => {
         if (settled) return;
         settled = true;
@@ -2080,7 +2132,7 @@ export function runDelegateProcess(
       }
       cleanup();
       if (terminationError) reject(terminationError);
-      else resolvePromise(accumulator.result(stderr, code));
+      else resolvePromise(accumulator.result(stderr, owned.cliExitCode ?? code));
     });
 
     child.on("error", (error) => {
