@@ -5,7 +5,7 @@ Requires Piclaw `>=3.3.2` in single-user mode.
 
 ## Inbound agent access is currently disabled
 
-Version 0.3.0 is fail-closed: the current Piclaw runtime has no supported unattended
+Version 0.3.1 is fail-closed: the current Piclaw runtime has no supported unattended
 capability combining exact target-lifetime admission, cancellation and host-bound
 message references. Allowlisted plain text gets:
 
@@ -18,6 +18,8 @@ by the background poller. The injected ingress interface is exercised by tests;
 the startup runtime supplies `ingress: null`.
 
 Polling starts independently of agent sessions and can answer local notices.
+`/start` also reports that agent access is unavailable when there is no supported
+ingress; with a supported ingress it keeps the normal connected greeting.
 If a future supported ingress is integrated, only a matching host-provided
 `{addonId, intentId}`, chat JID and incarnation can claim a reply. Other web,
 side-session or scheduled activity is never mirrored. One reply obligation is
@@ -100,8 +102,13 @@ obligation receives the terminal notice (subject to Telegram transport failure):
 A reply send failure instead gets a single delivery-failure notice, without
 retrying that notice. The terminal notice is reserved for stop/disable.
 
-This does **not** claim that agent work was aborted. Disabling via Settings does
-not override `PICLAW_TELEGRAM_ENABLED=1` on a later start; unset that override too.
+This does **not** claim that agent work was aborted. `PICLAW_TELEGRAM_ENABLED=1`
+forces effective enablement, even when stored `enabled` is false. Settings disable
+is rejected with an explicit environment-enablement error while that override is
+set; unset it before disabling. Rejection leaves polling and status unchanged.
+A save that results in effective-disabled settings fences polling immediately.
+No-op detection uses effective settings and the active token, so environment-only
+enablement does not hide a token change.
 
 Text-like settings controls use the host's shared `settings-addon-*` styling,
 with a package-local fallback for older hosts. Tokens remain keychain-only.

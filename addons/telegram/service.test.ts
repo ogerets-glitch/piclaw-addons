@@ -214,6 +214,57 @@ test("environment token takes precedence over the keychain", async () => {
   expect(h.tokens).toEqual(["999:env-token"]);
 });
 
+test("environment-only enablement rejects Settings disable without changing polling or status", async () => {
+  const h = harness({ settings: { enabled: false }, env: {
+    PICLAW_TELEGRAM_ENABLED: "1",
+    PICLAW_TELEGRAM_ALLOWED_USER_IDS: String(OPERATOR),
+    PICLAW_TELEGRAM_TARGET_CHAT_JID: TARGET,
+    PICLAW_TELEGRAM_TARGET_INCARNATION: INCARNATION,
+  } });
+  active = h.service;
+  await h.service.start();
+  await settle(() => h.api.polls === 1, "environment-enabled poll");
+  const run = h.service["active"];
+  const stored = h.service.readStoredSettings();
+  await expect(h.service.saveSettings({ enabled: false }, settingsContext)).rejects.toThrow(
+    "The environment enables Telegram via PICLAW_TELEGRAM_ENABLED=1. Unset it before disabling Telegram in Settings.",
+  );
+  expect(h.service.readStoredSettings()).toEqual(stored);
+  expect(h.service["active"]).toBe(run);
+  expect(run!.ingress.signal.aborted).toBeFalse();
+  expect(await h.service.view()).toMatchObject({ enabled: true, connected: true, status: "Connected" });
+});
+
+test("environment-enabled no-op save preserves polling but applies keychain rotation", async () => {
+  const options: HarnessOptions = { settings: { enabled: false }, keychain: "old:token", env: {
+    PICLAW_TELEGRAM_ENABLED: "1",
+    PICLAW_TELEGRAM_ALLOWED_USER_IDS: String(OPERATOR),
+    PICLAW_TELEGRAM_TARGET_CHAT_JID: TARGET,
+    PICLAW_TELEGRAM_TARGET_INCARNATION: INCARNATION,
+  } };
+  const h = harness(options);
+  active = h.service;
+  const rotated = new FakeApi();
+  h.service["deps"].createApi = async (token) => {
+    h.tokens.push(token);
+    return token === "old:token" ? h.api : rotated;
+  };
+  await h.service.start();
+  await settle(() => h.api.polls === 1, "environment-enabled poll");
+  const run = h.service["active"];
+  await h.service.saveSettings({});
+  expect(h.service["active"]).toBe(run);
+  expect(run!.ingress.signal.aborted).toBeFalse();
+  expect(h.tokens).toEqual(["old:token"]);
+  options.keychain = "new:token";
+  await h.service.saveSettings({}, settingsContext);
+  await settle(() => rotated.polls === 1, "rotated environment-enabled poll");
+  expect(run!.ingress.signal.aborted).toBeTrue();
+  expect(h.tokens).toEqual(["old:token", "new:token"]);
+  expect(h.service.readStoredSettings().enabled).toBeFalse();
+  expect(await h.service.view()).toMatchObject({ enabled: true, connected: true, status: "Connected" });
+});
+
 test("session shutdown leaves polling running; lifecycle shutdown stops it", async () => {
   const h = harness();
   active = h.service;
@@ -298,6 +349,19 @@ test("commands are answered locally and never queued", async () => {
   await settle(() => h.api.sent.length === 2, "notices");
   expect(h.enqueued).toEqual([]);
   expect(h.api.sent).toEqual([[OPERATOR, NOTICES.command], [OPERATOR, NOTICES.start]]);
+});
+
+test.each([
+  ["unavailable ingress", null, "Agent access via Telegram is not available yet on this Piclaw version."],
+  ["supported ingress", undefined, "Connected to Piclaw. Send a plain text message."],
+])("/start reports %s without queueing a message", async (_label, ingress, reply) => {
+  const h = harness({ ingress });
+  active = h.service;
+  h.api.batches.push([textUpdate(1, "/start")]);
+  await h.service.start();
+  await settle(() => h.api.sent.length === 1, "/start notice");
+  expect(h.api.sent).toEqual([[OPERATOR, reply]]);
+  expect(h.enqueued).toEqual([]);
 });
 
 test("settings are validated, stored globally without secrets and applied on reload", async () => {
@@ -866,7 +930,7 @@ for (const failure of ["context", "incarnation", "target", "storage", "write"] a
     expect(h.service.readStoredSettings()).toEqual(old);
     h.api.push([textUpdate(1, "/start")]);
     await settle(() => h.api.sent.length === 1, "poll still receiving");
-    expect(h.api.sent).toEqual([[OPERATOR, NOTICES.start]]);
+    expect(h.api.sent).toEqual([[OPERATOR, NOTICES.unavailable]]);
   });
 }
 
@@ -881,6 +945,7 @@ test("disable commits and closes an obligation even when its target was deleted"
   expect(h.service["active"]).toBeNull();
   expect(h.service["pending"]).toBeNull();
   expect(h.api.sent).toEqual([[OPERATOR, NOTICES.terminal]]);
+  expect(await h.service.view()).toMatchObject({ enabled: false, connected: false, status: "Stopped" });
 });
 
 test("unchanged save returns without context or target validation", async () => {

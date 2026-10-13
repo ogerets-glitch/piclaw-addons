@@ -163,7 +163,8 @@ function TelegramSettings() {
 
       <p style="font-size: 11px; color: var(--text-secondary, #71767b); margin-top: 12px;">
         Create a bot via <a href="https://t.me/BotFather" target="_blank" style="color: var(--accent, #1d9bf0);">@BotFather</a> on Telegram. The token is stored in keychain entry <code>${BOT_TOKEN_KEYCHAIN}</code>. Saving applies the settings immediately.
-        Inbound agent access is disabled until Piclaw supports unattended host-bound dispatch.
+        Inbound agent access is disabled until Piclaw supports unattended host-bound dispatch; /start reports that agent access is unavailable.
+        If PICLAW_TELEGRAM_ENABLED=1 enables Telegram through the environment, Settings disable is rejected; unset that override first.
       </p>
     </section>
   `;

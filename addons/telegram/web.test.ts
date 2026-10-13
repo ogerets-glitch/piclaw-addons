@@ -1,6 +1,9 @@
 import { expect, test } from "bun:test";
 
-test("settings pane reloads server status after a rejected save", async () => {
+test.each([
+  "open reply obligation",
+  "The environment enables Telegram via PICLAW_TELEGRAM_ENABLED=1. Unset it before disabling Telegram in Settings.",
+])("settings pane reloads server status after a rejected save: %s", async (error) => {
   const host = globalThis as any;
   const previousPreact = host.__piclawPreactHtm;
   const previousRegistry = host.__piclawSettingsPaneRegistry;
@@ -22,16 +25,18 @@ test("settings pane reloads server status after a rejected save", async () => {
   host.__piclawSettingsPaneRegistry = { registerSettingsPane: (definition: any) => { pane = definition.component; } };
   globalThis.fetch = (async (_input: unknown, init?: RequestInit) => {
     requests.push(init?.method ?? "GET");
-    if (init?.method === "POST") return Response.json({ error: "open reply obligation" }, { status: 409 });
+    if (init?.method === "POST") return Response.json({ error }, { status: 409 });
     return Response.json({ enabled: true, connected: false, status: "Disconnected", botTokenConfigured: true, targets: [] });
   }) as typeof fetch;
   try {
-    await import(`./web/index.ts?save-error-test=${Date.now()}`);
+    await import(`./web/index.ts?save-error-test=${encodeURIComponent(error)}`);
     expect(pane).toBeDefined();
-    pane!();
+    const rendered = pane!() as { strings: TemplateStringsArray };
+    expect(rendered.strings.join("")).toContain("Settings disable is rejected; unset that override first.");
+    expect(rendered.strings.join("")).toContain("/start reports that agent access is unavailable.");
     await callbacks[1]();
     expect(requests).toEqual(["POST", "GET"]);
-    expect(stateChanges).toContainEqual([2, "open reply obligation"]);
+    expect(stateChanges).toContainEqual([2, error]);
     expect(stateChanges).toContainEqual([0, { enabled: true, connected: false, status: "Disconnected", botTokenConfigured: true, targets: [] }]);
     expect(stateChanges.at(-1)).toEqual([1, false]);
   } finally {

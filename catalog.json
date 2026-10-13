@@ -929,7 +929,7 @@
     {
       "slug": "telegram",
       "name": "@rcarmo/piclaw-addon-telegram",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "type": "extension",
       "description": "Telegram Bot channel for PiClaw. Long-polls the Bot API at startup for local notices. Inbound agent access is currently unavailable.",
       "path": "addons/telegram",
@@ -942,7 +942,7 @@
       "skills": [],
       "install": {
         "kind": "tarball",
-        "spec": "https://rcarmo.github.io/piclaw-addons/packages/piclaw-addon-telegram-0.3.0.tgz"
+        "spec": "https://rcarmo.github.io/piclaw-addons/packages/piclaw-addon-telegram-0.3.1.tgz"
       },
       "updatedAt": "2026-10-12"
     },

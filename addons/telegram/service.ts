@@ -220,9 +220,9 @@ export class TelegramService {
   }
 
   /** Stored settings with environment overrides applied. */
-  effectiveSettings(): TelegramSettings {
+  effectiveSettings(stored = this.readStoredSettings()): TelegramSettings {
     const env = this.deps.env;
-    const settings = this.readStoredSettings();
+    const settings = { ...stored };
     if (env.PICLAW_TELEGRAM_ENABLED === "1") settings.enabled = true;
     const ids = env.PICLAW_TELEGRAM_ALLOWED_USER_IDS !== undefined ? parseAllowedUserIds(env.PICLAW_TELEGRAM_ALLOWED_USER_IDS) : undefined;
     if (ids !== undefined) settings.allowedUserIds = ids ?? [];
@@ -237,22 +237,29 @@ export class TelegramService {
 
   /** Validate before committing and fencing; never retain a request context. */
   async saveSettings(payload: unknown, context?: SettingsContext | null): Promise<TelegramSettings> {
-    const previous = this.readStoredSettings();
-    const next = parseSettings(payload, previous);
+    const stored = this.readStoredSettings();
+    const next = parseSettings(payload, stored);
     if (typeof next === "string") throw new Error(`Invalid Telegram settings: ${next}`);
+    if (isRecord(payload) && payload.enabled === false && this.deps.env.PICLAW_TELEGRAM_ENABLED === "1") {
+      throw new Error("The environment enables Telegram via PICLAW_TELEGRAM_ENABLED=1. Unset it before disabling Telegram in Settings.");
+    }
+    const previous = this.effectiveSettings(stored);
+    const effectiveNext = this.effectiveSettings(next);
     const generation = this.generation;
-    const sameSettings = JSON.stringify(previous) === JSON.stringify(next);
-    const unchanged = sameSettings && (!next.enabled || (
+    // Persist stored changes even when an environment override masks them.
+    const sameSettings = JSON.stringify(stored) === JSON.stringify(next)
+      && JSON.stringify(previous) === JSON.stringify(effectiveNext);
+    const unchanged = sameSettings && (!effectiveNext.enabled || (
       await this.resolveToken() === this.active?.token && this.active !== null
       && !this.active.failed && this.live(this.active)
     ));
     if (unchanged) return next;
-    const disable = previous.enabled && !next.enabled;
+    const disable = previous.enabled && !effectiveNext.enabled;
     if (!context) throw new Error("Verified local context unavailable; Telegram settings were not saved.");
-    if (next.enabled) {
-      if (!next.targetIncarnation) throw new Error("Select a current target chat lifetime.");
-      const target = await context.resolveTarget({ chatJid: next.targetChatJid, incarnation: next.targetIncarnation });
-      if (!target || target.chatJid !== next.targetChatJid || target.incarnation !== next.targetIncarnation) throw new Error("The selected target chat is stale or unavailable.");
+    if (effectiveNext.enabled) {
+      if (!effectiveNext.targetIncarnation) throw new Error("Select a current target chat lifetime.");
+      const target = await context.resolveTarget({ chatJid: effectiveNext.targetChatJid, incarnation: effectiveNext.targetIncarnation });
+      if (!target || target.chatJid !== effectiveNext.targetChatJid || target.incarnation !== effectiveNext.targetIncarnation) throw new Error("The selected target chat is stale or unavailable.");
     }
     if (generation !== this.generation) throw new Error("Telegram lifecycle changed while validating settings; settings were not saved.");
     const kv = this.kv();
@@ -467,7 +474,8 @@ export class TelegramService {
     const decision = evaluateUpdate(update, allowed, activatedAt);
     if (decision.kind === "ignore") return;
     if (decision.kind !== "accept") {
-      await this.send(run, decision.chatId, NOTICES[decision.kind], false);
+      const notice = decision.kind === "start" && !this.deps.ingress ? NOTICES.unavailable : NOTICES[decision.kind];
+      await this.send(run, decision.chatId, notice, false);
       return;
     }
     if (!this.deps.ingress) {
